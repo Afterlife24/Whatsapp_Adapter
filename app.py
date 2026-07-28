@@ -341,22 +341,59 @@ async def whatsapp_webhook(
     return Response(content=str(resp), media_type="application/xml")
 
 
+def _split_message(body: str, max_len: int = 1500) -> list[str]:
+    """Split a long message into chunks that fit within WhatsApp's 1600 char limit.
+
+    Splits at newlines when possible to keep formatting intact.
+    Uses 1500 as threshold to leave room for any Twilio overhead.
+    """
+    if len(body) <= max_len:
+        return [body]
+
+    chunks: list[str] = []
+    while body:
+        if len(body) <= max_len:
+            chunks.append(body)
+            break
+
+        # Find a newline to split at (prefer splitting at paragraph/line boundaries)
+        split_idx = body.rfind("\n", 0, max_len)
+        if split_idx == -1 or split_idx < max_len // 2:
+            # No good newline — split at last space
+            split_idx = body.rfind(" ", 0, max_len)
+        if split_idx == -1:
+            # No space either — hard cut
+            split_idx = max_len
+
+        chunks.append(body[:split_idx].rstrip())
+        body = body[split_idx:].lstrip("\n ")
+
+    return chunks
+
+
 def _send_twilio_reply(to: str, body: str) -> None:
-    """Send a WhatsApp message via Twilio API."""
+    """Send a WhatsApp message via Twilio API.
+
+    Automatically splits messages exceeding WhatsApp's 1600 char limit
+    into multiple messages.
+    """
     if not twilio_client:
         logger.error("Twilio client not configured — cannot send reply")
         return
 
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
-    try:
-        message = twilio_client.messages.create(
-            from_=from_number,
-            to=to,
-            body=body,
-        )
-        logger.info(f"✅ Reply sent to {to} (SID: {message.sid})")
-    except Exception as e:
-        logger.error(f"❌ Failed to send reply to {to}: {e}")
+    chunks = _split_message(body)
+
+    for chunk in chunks:
+        try:
+            message = twilio_client.messages.create(
+                from_=from_number,
+                to=to,
+                body=chunk,
+            )
+            logger.info(f"✅ Reply sent to {to} (SID: {message.sid})")
+        except Exception as e:
+            logger.error(f"❌ Failed to send reply to {to}: {e}")
 
 
 async def _send_to_dograh(
