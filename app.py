@@ -18,7 +18,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -92,6 +92,18 @@ def _get_agent_config(to_number: str) -> tuple[str, str]:
     )
 
 
+def _get_agent_mapping(to_number: str) -> dict:
+    """Get the full agent mapping dict for a Twilio number."""
+    clean = to_number.replace("whatsapp:", "").strip()
+    if clean in AGENT_MAPPINGS:
+        return AGENT_MAPPINGS[clean]
+    return {"api_key": DOGRAH_API_KEY, "trigger_path": DOGRAH_TRIGGER_PATH}
+
+
+# Follow-up delays (in seconds). Per-agent override via "followup_delays" key.
+DEFAULT_FOLLOWUP_DELAYS = [300, 900, 1800, 10800]  # 5m, 15m, 30m, 3h
+
+
 # ---------------------------------------------------------------------------
 # MongoDB
 # ---------------------------------------------------------------------------
@@ -149,13 +161,16 @@ async def startup():
             f"⚠️ MongoDB unavailable ({e}), using in-memory storage")
         mongo_client = None
 
+    # Start follow-up scheduler
+    asyncio.create_task(_followup_loop())
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
 
 
-async def get_or_create_session(phone_number: str) -> dict:
+async def get_or_create_session(phone_number: str, agent_number: str = "") -> dict:
     """Get or create a session for the given phone number."""
     if sessions_collection is not None:
         session = await sessions_collection.find_one({"phone_number": phone_number})
@@ -163,8 +178,12 @@ async def get_or_create_session(phone_number: str) -> dict:
             return session
         new_session = {
             "phone_number": phone_number,
+            "agent_number": agent_number,
             "human_takeover": False,
+            "lead_status": "active",  # active | completed | not_qualified | inactive
+            "followup_stage": 0,  # 0 = no followup sent yet, 1-3 = followup N sent
             "last_activity": datetime.now(timezone.utc),
+            "last_agent_reply_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc),
         }
         await sessions_collection.insert_one(new_session)
@@ -173,8 +192,12 @@ async def get_or_create_session(phone_number: str) -> dict:
         if phone_number not in SESSIONS_STORE:
             SESSIONS_STORE[phone_number] = {
                 "phone_number": phone_number,
+                "agent_number": agent_number,
                 "human_takeover": False,
+                "lead_status": "active",
+                "followup_stage": 0,
                 "last_activity": datetime.now(timezone.utc),
+                "last_agent_reply_at": datetime.now(timezone.utc),
             }
         return SESSIONS_STORE[phone_number]
 
@@ -247,6 +270,150 @@ async def set_human_takeover(phone_number: str, status: bool) -> None:
     CONVERSATIONS_CACHE["data"] = None
 
 
+async def _reset_followup(phone_number: str) -> None:
+    """Reset follow-up stage when user replies (they're active again)."""
+    now = datetime.now(timezone.utc)
+    if sessions_collection is not None:
+        await sessions_collection.update_one(
+            {"phone_number": phone_number},
+            {"$set": {
+                "followup_stage": 0,
+                "last_activity": now,
+                "last_agent_reply_at": now,
+            }},
+        )
+    else:
+        session = SESSIONS_STORE.get(phone_number)
+        if session:
+            session["followup_stage"] = 0
+            session["last_activity"] = now
+            session["last_agent_reply_at"] = now
+
+
+async def _mark_agent_replied(phone_number: str) -> None:
+    """Track when the agent last replied (for follow-up timing)."""
+    now = datetime.now(timezone.utc)
+    if sessions_collection is not None:
+        await sessions_collection.update_one(
+            {"phone_number": phone_number},
+            {"$set": {"last_agent_reply_at": now}},
+        )
+    else:
+        session = SESSIONS_STORE.get(phone_number)
+        if session:
+            session["last_agent_reply_at"] = now
+
+
+async def _set_lead_status(phone_number: str, status: str) -> None:
+    """Update lead status (active, completed, not_qualified, inactive)."""
+    if sessions_collection is not None:
+        await sessions_collection.update_one(
+            {"phone_number": phone_number},
+            {"$set": {"lead_status": status}},
+        )
+    else:
+        session = SESSIONS_STORE.get(phone_number)
+        if session:
+            session["lead_status"] = status
+    CONVERSATIONS_CACHE["data"] = None
+
+
+async def _increment_followup(phone_number: str, stage: int) -> None:
+    """Set the follow-up stage for a session."""
+    if sessions_collection is not None:
+        await sessions_collection.update_one(
+            {"phone_number": phone_number},
+            {"$set": {"followup_stage": stage}},
+        )
+    else:
+        session = SESSIONS_STORE.get(phone_number)
+        if session:
+            session["followup_stage"] = stage
+
+
+async def _store_lead_from_chat(phone_number: str) -> None:
+    """Extract lead data from chat messages and store in 'leads' collection.
+
+    Parses the full conversation to find: patient name, concern/pain area,
+    city, locality, and location link. Uses simple pattern matching on the
+    bot's questions and user's replies.
+    """
+    if db is None:
+        return
+
+    messages = []
+    if chats_collection is not None:
+        cursor = chats_collection.find(
+            {"phone_number": phone_number}).sort("timestamp", 1)
+        messages = await cursor.to_list(length=100)
+
+    if not messages:
+        return
+
+    # Build full conversation text for extraction
+    user_msgs = [m["content"] for m in messages if m["sender"] == "user"]
+    all_text = " ".join(user_msgs).lower()
+
+    # Extract location (Google Maps URL or coordinates)
+    location = ""
+    for msg in reversed(user_msgs):
+        if "maps.google.com" in msg or "maps.app.goo.gl" in msg or "goo.gl" in msg:
+            location = msg.strip()
+            break
+
+    # Extract name: usually a short reply (1-2 words) after bot asks for name
+    name = ""
+    for i, m in enumerate(messages):
+        if m["sender"] == "agent" and "name" in m["content"].lower() and "please" in m["content"].lower():
+            # Next user message is likely the name
+            for j in range(i + 1, len(messages)):
+                if messages[j]["sender"] == "user":
+                    candidate = messages[j]["content"].strip()
+                    # Name is usually short, not a number or URL
+                    if len(candidate) < 40 and not candidate.startswith("http") and not candidate.isdigit():
+                        name = candidate
+                    break
+            if name:
+                break
+
+    # Extract city/locality: reply after bot asks for city/area
+    city_locality = ""
+    for i, m in enumerate(messages):
+        if m["sender"] == "agent" and ("city" in m["content"].lower() or "area" in m["content"].lower() or "locality" in m["content"].lower()):
+            for j in range(i + 1, len(messages)):
+                if messages[j]["sender"] == "user":
+                    candidate = messages[j]["content"].strip()
+                    if not candidate.startswith("http") and len(candidate) < 100:
+                        city_locality = candidate
+                    break
+            if city_locality:
+                break
+
+    # Extract concern: first substantive user message about pain
+    concern = ""
+    for msg in user_msgs[0:5]:  # Check first few user messages
+        pain_keywords = ["pain", "hurt", "ache", "injury", "surgery",
+                         "paralysis", "stroke", "rehab", "stiff", "swell"]
+        if any(kw in msg.lower() for kw in pain_keywords):
+            concern = msg.strip()
+            break
+
+    lead_doc = {
+        "phone_number": phone_number,
+        "patient_name": name,
+        "concern": concern,
+        "city_locality": city_locality,
+        "user_location": location,
+        "lead_status": "completed",
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    leads_collection = db["leads"]
+    await leads_collection.insert_one(lead_doc)
+    logger.info(
+        f"💾 Lead stored: {name} | {concern[:50]} | {city_locality} | {location[:50]}")
+
+
 # ---------------------------------------------------------------------------
 # Webhook endpoint
 # ---------------------------------------------------------------------------
@@ -263,6 +430,8 @@ async def whatsapp_webhook(
     From: str = Form(...),
     To: str = Form(...),
     Body: str = Form(""),
+    Latitude: str = Form(None),
+    Longitude: str = Form(None),
 ):
     """Twilio WhatsApp webhook handler.
 
@@ -276,6 +445,11 @@ async def whatsapp_webhook(
     sender = From  # e.g. "whatsapp:+919876543210"
     receiver = To  # e.g. "whatsapp:+14155551234"
 
+    # Handle location pins (Twilio sends lat/lng separately, not in Body)
+    if not user_message and Latitude and Longitude:
+        user_message = f"https://maps.google.com/?q={Latitude},{Longitude}"
+        logger.info(f"📍 Location pin from {sender}: {user_message}")
+
     logger.info(f"📩 Incoming from {sender}: {user_message[:100]}")
 
     if not user_message:
@@ -283,7 +457,10 @@ async def whatsapp_webhook(
         return Response(content=str(resp), media_type="application/xml")
 
     # Ensure session exists
-    await get_or_create_session(sender)
+    await get_or_create_session(sender, agent_number=receiver)
+
+    # User replied — reset follow-up timer and stage
+    await _reset_followup(sender)
 
     # Store the user's message
     await store_message(sender, "user", user_message, "user")
@@ -306,12 +483,14 @@ async def whatsapp_webhook(
         return Response(content=str(resp), media_type="application/xml")
 
     # Call Dograh's public text-chat endpoint
-    assistant_text = await _send_to_dograh(
+    dograh_response = await _send_to_dograh(
         api_key=api_key,
         trigger_path=trigger_path,
         session_key=sender,
         text=user_message,
     )
+    assistant_text = dograh_response["assistant_text"]
+    is_completed = dograh_response["is_completed"]
 
     # Check if the agent is requesting a human handoff
     if assistant_text and "TRANSFER_TO_HUMAN" in assistant_text:
@@ -332,6 +511,42 @@ async def whatsapp_webhook(
     if assistant_text:
         _send_twilio_reply(sender, assistant_text)
         await store_message(sender, "agent", assistant_text, "ai")
+        await _mark_agent_replied(sender)
+
+        # Use Dograh's is_completed flag (workflow transitioned to end node)
+        if is_completed:
+            await _set_lead_status(sender, "completed")
+            await _store_lead_from_chat(sender)
+            logger.info(
+                f"✅ Lead {sender} marked COMPLETED (is_completed=True)")
+        else:
+            # Fallback: keyword detection for end states
+            text_lower = assistant_text.lower()
+            if any(kw in text_lower for kw in [
+                "therapist will be assigned",
+                "noted your location",
+                "assign a therapist",
+                "will assign",
+                "session is now booked",
+                "confirm your appointment",
+                "confirm the appointment",
+                "reach out to you soon",
+                "thank you for sharing the location",
+                "thank you for sharing your location",
+            ]):
+                await _set_lead_status(sender, "completed")
+                await _store_lead_from_chat(sender)
+                logger.info(
+                    f"✅ Lead {sender} marked COMPLETED (keyword match)")
+            elif any(kw in text_lower for kw in [
+                "wishing you good health",
+                "no worries at all",
+                "feel free to reach out anytime",
+                "change your mind",
+                "wish you well",
+            ]):
+                await _set_lead_status(sender, "not_qualified")
+                logger.info(f"🚫 Lead {sender} marked NOT_QUALIFIED")
     else:
         fallback = "I'm sorry, I couldn't process your message. Please try again."
         _send_twilio_reply(sender, fallback)
@@ -402,8 +617,11 @@ async def _send_to_dograh(
     trigger_path: str,
     session_key: str,
     text: str,
-) -> Optional[str]:
-    """Send a message to Dograh's public text-chat API and return the reply."""
+) -> dict:
+    """Send a message to Dograh's public text-chat API and return the response.
+
+    Returns dict with keys: assistant_text, is_completed, workflow_run_id.
+    """
     url = f"{DOGRAH_API_BASE}/public/agent/text-chat/test/workflow/{trigger_path}/message"
 
     payload = {
@@ -423,23 +641,186 @@ async def _send_to_dograh(
         if response.status_code == 200:
             data = response.json()
             assistant_text = data.get("assistant_text")
+            is_completed = data.get("is_completed", False)
+            workflow_run_id = data.get("workflow_run_id")
             logger.info(
                 f"🤖 Dograh reply for {session_key}: "
                 f"{assistant_text[:80] if assistant_text else '(empty)'}"
+                f"{' [COMPLETED]' if is_completed else ''}"
             )
-            return assistant_text
+            return {
+                "assistant_text": assistant_text,
+                "is_completed": is_completed,
+                "workflow_run_id": workflow_run_id,
+            }
         else:
             logger.error(
                 f"Dograh API error {response.status_code}: {response.text[:200]}"
             )
-            return None
+            return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
 
     except httpx.TimeoutException:
         logger.error(f"Dograh API timeout for session {session_key}")
-        return None
+        return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
     except Exception as e:
         logger.error(f"Dograh API call failed: {e}")
-        return None
+        return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
+
+
+# ---------------------------------------------------------------------------
+# Follow-up Scheduler
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_PROMPTS = [
+    "[SYSTEM: The user has not replied for a while. Send a gentle follow-up based on where the conversation left off. If you were waiting for their name, ask for it again. If waiting for location, remind them. If waiting for confirmation, ask again. Keep it short, friendly, 1-2 lines. Don't repeat your exact last message — rephrase it.]",
+    "[SYSTEM: Second follow-up. The user still hasn't replied. Send another brief reminder about whatever you last asked them. Different wording from before. Keep it warm and zero-pressure.]",
+    "[SYSTEM: Final follow-up. The user hasn't responded after two reminders. Send a last gentle message saying you're here whenever they're ready, no rush. This is the final attempt.]",
+]
+
+
+async def _followup_loop() -> None:
+    """Background loop: checks for idle sessions and sends follow-ups.
+
+    Runs every 60s. Only fires for agents with followups_enabled=true.
+    """
+    # Log startup info
+    followup_agents = [n for n, m in AGENT_MAPPINGS.items()
+                       if m.get("followups_enabled")]
+    logger.info(
+        f"🔄 Follow-up scheduler started. Enabled agents: {followup_agents}")
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await _process_followups()
+        except Exception as e:
+            logger.error(f"Follow-up loop error: {e}")
+
+
+async def _process_followups() -> None:
+    """Scan sessions and send follow-ups where due."""
+    now = datetime.now(timezone.utc)
+
+    # Build set of agent numbers that have followups enabled
+    followup_agents = set()
+    for number, mapping in AGENT_MAPPINGS.items():
+        if mapping.get("followups_enabled"):
+            followup_agents.add(number)
+
+    if not followup_agents:
+        return
+
+    # Query sessions that are active and have an agent_number in followup_agents
+    if sessions_collection is not None:
+        query = {
+            # Sessions without lead_status are also "active" (old sessions)
+            "lead_status": {"$in": ["active", None]},
+            "human_takeover": {"$ne": True},
+            "agent_number": {"$regex": "|".join(
+                a.replace("+", "\\+") for a in followup_agents
+            )},
+        }
+        sessions = await sessions_collection.find(query).to_list(length=500)
+        # Also include sessions that don't have lead_status field at all
+        no_status_query = {
+            "lead_status": {"$exists": False},
+            "human_takeover": {"$ne": True},
+        }
+        no_status_sessions = await sessions_collection.find(no_status_query).to_list(length=500)
+        # Merge, dedup by phone_number
+        seen = {s["phone_number"] for s in sessions}
+        for s in no_status_sessions:
+            if s["phone_number"] not in seen:
+                sessions.append(s)
+                seen.add(s["phone_number"])
+    else:
+        sessions = [
+            s for s in SESSIONS_STORE.values()
+            if s.get("lead_status", "active") == "active"
+            and not s.get("human_takeover")
+            and any(a in s.get("agent_number", "") for a in followup_agents)
+        ]
+
+    logger.debug(
+        f"🔍 Follow-up scan: found {len(sessions)} eligible session(s)")
+
+    for session in sessions:
+        phone_number = session["phone_number"]
+        agent_number = session.get("agent_number", "")
+        stage = session.get("followup_stage", 0)
+        last_reply = session.get(
+            "last_agent_reply_at") or session.get("last_activity")
+
+        if not last_reply or stage >= len(FOLLOWUP_PROMPTS):
+            continue
+
+        # Get delays for this agent — if agent_number is missing, use first followup-enabled agent
+        clean_agent = agent_number.replace("whatsapp:", "").strip()
+        mapping = AGENT_MAPPINGS.get(clean_agent, {})
+        if not mapping.get("followups_enabled"):
+            # Try to find a matching agent from the enabled set
+            if len(followup_agents) == 1:
+                clean_agent = next(iter(followup_agents))
+                mapping = AGENT_MAPPINGS[clean_agent]
+            else:
+                continue
+        delays = mapping.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS)
+
+        if stage >= len(delays):
+            continue
+
+        # Check if enough time has passed since last agent reply
+        if isinstance(last_reply, str):
+            last_reply = datetime.fromisoformat(
+                last_reply.replace("Z", "+00:00"))
+        # Handle naive datetimes from old sessions
+        if last_reply.tzinfo is None:
+            last_reply = last_reply.replace(tzinfo=timezone.utc)
+
+        elapsed = (now - last_reply).total_seconds()
+
+        # Skip stale sessions (idle > 24h) — these are old/abandoned
+        if elapsed > 86400:
+            continue
+        if elapsed < delays[stage]:
+            continue
+
+        # Time to send follow-up
+        logger.info(
+            f"⏰ Follow-up {stage + 1} for {phone_number} "
+            f"(idle {int(elapsed)}s, threshold {delays[stage]}s)"
+        )
+
+        try:
+            api_key, trigger_path = mapping["api_key"], mapping["trigger_path"]
+        except KeyError:
+            continue
+
+        # Send synthetic message to Dograh to get context-aware follow-up
+        dograh_response = await _send_to_dograh(
+            api_key=api_key,
+            trigger_path=trigger_path,
+            session_key=phone_number,
+            text=FOLLOWUP_PROMPTS[stage],
+        )
+        followup_text = dograh_response["assistant_text"]
+
+        if followup_text:
+            _send_twilio_reply(phone_number, followup_text)
+            await store_message(phone_number, "agent", followup_text, "followup")
+            await _mark_agent_replied(phone_number)
+        else:
+            logger.warning(
+                f"Dograh returned no text for follow-up {stage + 1}")
+
+        new_stage = stage + 1
+        await _increment_followup(phone_number, new_stage)
+
+        # If all follow-ups exhausted, mark inactive
+        if new_stage >= len(FOLLOWUP_PROMPTS):
+            await _set_lead_status(phone_number, "inactive")
+            logger.info(
+                f"💤 Lead {phone_number} marked INACTIVE after {new_stage} follow-ups")
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +933,43 @@ async def release_conversation(request: Request):
     )
 
     return {"success": True, "message": "Released to AI"}
+
+
+@app.post("/webhook/lead-data")
+async def receive_lead_data(request: Request):
+    """Webhook endpoint called by Dograh's webhook node when a conversation completes.
+
+    Receives extracted variables (patient_name, concern, city, locality,
+    user_location, notes) and stores them in MongoDB collection 'leads'.
+    """
+    data = await request.json()
+    logger.info(f"📋 Lead data received: {json.dumps(data)[:200]}")
+
+    # Dograh webhook payload uses gathered_context for extraction vars
+    gathered = data.get("gathered_context", {})
+    initial = data.get("initial_context", {})
+
+    lead_doc = {
+        "patient_name": gathered.get("patient_name", ""),
+        "concern": gathered.get("concern", ""),
+        "city": gathered.get("city", ""),
+        "locality": gathered.get("locality", ""),
+        "user_location": gathered.get("user_location", ""),
+        "notes": gathered.get("notes", ""),
+        "phone_number": initial.get("phone_number", ""),
+        "workflow_run_id": data.get("workflow_run_id", ""),
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    if db is not None:
+        leads_collection = db["leads"]
+        await leads_collection.insert_one(lead_doc)
+        logger.info(
+            f"💾 Lead stored: {lead_doc['patient_name']} - {lead_doc['concern']}")
+    else:
+        logger.warning("MongoDB unavailable — lead data not stored")
+
+    return {"success": True}
 
 
 @app.post("/send-message")
