@@ -492,11 +492,19 @@ async def whatsapp_webhook(
     assistant_text = dograh_response["assistant_text"]
     is_completed = dograh_response["is_completed"]
 
-    # Prepend greeting on first interaction (only for agents with greeting configured)
-    session = await get_or_create_session(sender, agent_number=receiver)
+    # Send greeting on first interaction (only for agents with greeting configured)
     mapping = _get_agent_mapping(receiver)
-    if session.get("message_count", 0) <= 1 and assistant_text and mapping.get("greeting"):
-        if not assistant_text.startswith("Greetings"):
+    if assistant_text and mapping.get("greeting"):
+        # Check if this is the first bot reply for this session
+        is_first = True
+        if chats_collection is not None:
+            agent_msg_count = await chats_collection.count_documents(
+                {"phone_number": sender, "sender": "agent"}
+            )
+            is_first = agent_msg_count == 0
+            logger.debug(
+                f"Greeting check: {sender} has {agent_msg_count} agent msgs, is_first={is_first}")
+        if is_first and not assistant_text.startswith("Greetings"):
             _send_twilio_reply(sender, mapping["greeting"])
             await store_message(sender, "agent", mapping["greeting"], "ai")
 
@@ -696,6 +704,9 @@ async def _followup_loop() -> None:
                        if m.get("followups_enabled")]
     logger.info(
         f"🔄 Follow-up scheduler started. Enabled agents: {followup_agents}")
+    greeting_agents = {n: m.get("greeting")
+                       for n, m in AGENT_MAPPINGS.items() if m.get("greeting")}
+    logger.info(f"👋 Greeting configured: {greeting_agents}")
 
     while True:
         await asyncio.sleep(60)
