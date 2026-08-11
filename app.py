@@ -234,7 +234,7 @@ async def store_message(
     if sessions_collection is not None:
         await sessions_collection.update_one(
             {"phone_number": phone_number},
-            {"$set": {"last_activity": now}},
+            {"$set": {"last_activity": now}, "$inc": {"message_count": 1}},
             upsert=True,
         )
 
@@ -491,6 +491,14 @@ async def whatsapp_webhook(
     )
     assistant_text = dograh_response["assistant_text"]
     is_completed = dograh_response["is_completed"]
+
+    # Prepend greeting on first interaction (only for agents with greeting configured)
+    session = await get_or_create_session(sender, agent_number=receiver)
+    mapping = _get_agent_mapping(receiver)
+    if session.get("message_count", 0) <= 1 and assistant_text and mapping.get("greeting"):
+        if not assistant_text.startswith("Greetings"):
+            _send_twilio_reply(sender, mapping["greeting"])
+            await store_message(sender, "agent", mapping["greeting"], "ai")
 
     # Check if the agent is requesting a human handoff
     if assistant_text and "TRANSFER_TO_HUMAN" in assistant_text:
