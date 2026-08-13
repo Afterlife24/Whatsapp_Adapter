@@ -332,71 +332,77 @@ async def _increment_followup(phone_number: str, stage: int) -> None:
 
 
 async def _store_lead_from_chat(phone_number: str) -> None:
-    """Extract lead data from chat messages and store in 'leads' collection.
-
-    Parses the full conversation to find: patient name, concern/pain area,
-    city, locality, and location link. Uses simple pattern matching on the
-    bot's questions and user's replies.
-    """
+    """Store lead data. Uses Dograh's gathered_context if available, else chat parsing."""
     if db is None:
         return
 
+    # Get session for workflow_run_id
+    session = None
+    if sessions_collection is not None:
+        session = await sessions_collection.find_one({"phone_number": phone_number})
+
+    # Fallback: parse from chat messages
     messages = []
     if chats_collection is not None:
         cursor = chats_collection.find(
             {"phone_number": phone_number}).sort("timestamp", 1)
         messages = await cursor.to_list(length=100)
 
-    if not messages:
-        return
-
-    # Build full conversation text for extraction
     user_msgs = [m["content"] for m in messages if m["sender"] == "user"]
-    all_text = " ".join(user_msgs).lower()
 
-    # Extract location (Google Maps URL or coordinates)
+    # Location (Google Maps URL)
     location = ""
     for msg in reversed(user_msgs):
         if "maps.google.com" in msg or "maps.app.goo.gl" in msg or "goo.gl" in msg:
             location = msg.strip()
             break
 
-    # Extract name: usually a short reply (1-2 words) after bot asks for name
+    # Name: reply after bot asks "name" — skip if reply is "no", "yes", numbers, urls
     name = ""
     for i, m in enumerate(messages):
-        if m["sender"] == "agent" and "name" in m["content"].lower() and "please" in m["content"].lower():
-            # Next user message is likely the name
+        if m["sender"] == "agent" and "name" in m["content"].lower():
             for j in range(i + 1, len(messages)):
                 if messages[j]["sender"] == "user":
-                    candidate = messages[j]["content"].strip()
-                    # Name is usually short, not a number or URL
-                    if len(candidate) < 40 and not candidate.startswith("http") and not candidate.isdigit():
-                        name = candidate
+                    c = messages[j]["content"].strip()
+                    if (len(c) < 30 and not c.startswith("http")
+                            and not c.isdigit() and c.lower() not in ("no", "yes", "ok", "yah", "yeah")):
+                        name = c.split(" from ")[0].strip(
+                        ) if " from " in c.lower() else c
                     break
             if name:
                 break
 
-    # Extract city/locality: reply after bot asks for city/area
+    # City: reply after bot asks "location" or "where you are from"
     city_locality = ""
     for i, m in enumerate(messages):
-        if m["sender"] == "agent" and ("city" in m["content"].lower() or "area" in m["content"].lower() or "locality" in m["content"].lower()):
+        if m["sender"] == "agent" and any(kw in m["content"].lower() for kw in ["your location", "where you are from", "your city"]):
             for j in range(i + 1, len(messages)):
                 if messages[j]["sender"] == "user":
-                    candidate = messages[j]["content"].strip()
-                    if not candidate.startswith("http") and len(candidate) < 100:
-                        city_locality = candidate
+                    c = messages[j]["content"].strip()
+                    if (not c.startswith("http") and len(c) < 80
+                            and c.lower() not in ("no", "yes", "ok")
+                            and "hyderabad" not in c.lower()):
+                        city_locality = c
                     break
             if city_locality:
                 break
+    # Second pass: "from X" pattern
+    if not city_locality:
+        for msg in user_msgs[:3]:
+            if " from " in msg.lower():
+                city_locality = msg.split(" from ", 1)[1].strip()
+                break
 
-    # Extract concern: first substantive user message about pain
+    # Concern: reply after "issue" or "problem"
     concern = ""
-    for msg in user_msgs[0:5]:  # Check first few user messages
-        pain_keywords = ["pain", "hurt", "ache", "injury", "surgery",
-                         "paralysis", "stroke", "rehab", "stiff", "swell"]
-        if any(kw in msg.lower() for kw in pain_keywords):
-            concern = msg.strip()
-            break
+    for i, m in enumerate(messages):
+        if m["sender"] == "agent" and any(kw in m["content"].lower() for kw in ["issue", "problem", "what kind"]):
+            for j in range(i + 1, len(messages)):
+                if messages[j]["sender"] == "user":
+                    concern = messages[j]["content"].strip()
+                    break
+            if concern:
+                break
 
     lead_doc = {
         "phone_number": phone_number,
@@ -492,19 +498,20 @@ async def whatsapp_webhook(
     assistant_text = dograh_response["assistant_text"]
     is_completed = dograh_response["is_completed"]
 
-    # Send greeting on first interaction (only for agents with greeting configured)
+    # Send greeting if no agent message in the last 12 hours (new conversation)
     mapping = _get_agent_mapping(receiver)
     if assistant_text and mapping.get("greeting"):
-        # Check if this is the first bot reply for this session
-        is_first = True
+        should_greet = True
         if chats_collection is not None:
-            agent_msg_count = await chats_collection.count_documents(
-                {"phone_number": sender, "sender": "agent"}
+            twelve_hours_ago = datetime.now(timezone.utc) - timedelta(hours=12)
+            recent_agent_msgs = await chats_collection.count_documents(
+                {"phone_number": sender, "sender": "agent",
+                    "timestamp": {"$gte": twelve_hours_ago}}
             )
-            is_first = agent_msg_count == 0
+            should_greet = recent_agent_msgs == 0
             logger.debug(
-                f"Greeting check: {sender} has {agent_msg_count} agent msgs, is_first={is_first}")
-        if is_first and not assistant_text.startswith("Greetings"):
+                f"Greeting check: {sender} has {recent_agent_msgs} agent msgs in last 12h, should_greet={should_greet}")
+        if should_greet and not assistant_text.startswith("Greetings"):
             _send_twilio_reply(sender, mapping["greeting"])
             await store_message(sender, "agent", mapping["greeting"], "ai")
 
@@ -532,7 +539,8 @@ async def whatsapp_webhook(
         # Use Dograh's is_completed flag (workflow transitioned to end node)
         if is_completed:
             await _set_lead_status(sender, "completed")
-            await _store_lead_from_chat(sender)
+            if mapping.get("store_leads"):
+                await _store_lead_from_chat(sender)
             logger.info(
                 f"✅ Lead {sender} marked COMPLETED (is_completed=True)")
         else:
@@ -551,7 +559,8 @@ async def whatsapp_webhook(
                 "thank you for sharing your location",
             ]):
                 await _set_lead_status(sender, "completed")
-                await _store_lead_from_chat(sender)
+                if mapping.get("store_leads"):
+                    await _store_lead_from_chat(sender)
                 logger.info(
                     f"✅ Lead {sender} marked COMPLETED (keyword match)")
             elif any(kw in text_lower for kw in [
