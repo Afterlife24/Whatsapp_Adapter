@@ -65,39 +65,83 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 #   "+14155555678": {"api_key": "dk_yyy", "trigger_path": "uuid-yyy"}
 # }
 
+# AGENT_MAPPINGS from env — used ONLY for one-time migration to MongoDB on first startup.
+# After migration, all agent config is read from the 'agents' MongoDB collection.
 AGENT_MAPPINGS: dict = {}
 _raw_mappings = os.getenv("AGENT_MAPPINGS", "")
 if _raw_mappings:
     try:
         AGENT_MAPPINGS = json.loads(_raw_mappings)
-        logger.info(f"Loaded {len(AGENT_MAPPINGS)} agent mapping(s)")
+        logger.info(f"Loaded {len(AGENT_MAPPINGS)} agent mapping(s) for migration")
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse AGENT_MAPPINGS: {e}")
 
 
-def _get_agent_config(to_number: str) -> tuple[str, str]:
-    """Resolve which API key + trigger to use for a given Twilio number."""
+async def _get_agent_doc(to_number: str) -> dict:
+    """Look up agent config from MongoDB agents collection by phone number."""
     clean = to_number.replace("whatsapp:", "").strip()
-
-    if clean in AGENT_MAPPINGS:
-        mapping = AGENT_MAPPINGS[clean]
-        return mapping["api_key"], mapping["trigger_path"]
-
-    if DOGRAH_API_KEY and DOGRAH_TRIGGER_PATH:
-        return DOGRAH_API_KEY, DOGRAH_TRIGGER_PATH
-
+    if agents_collection is not None:
+        doc = await agents_collection.find_one({"phone_number": clean, "is_active": True})
+        if doc:
+            return doc
     raise ValueError(
-        f"No agent mapping found for number {to_number}. "
-        f"Set DOGRAH_API_KEY + DOGRAH_TRIGGER_PATH or configure AGENT_MAPPINGS."
+        f"No agent found for number {to_number}. Add it via the dashboard."
     )
 
 
-def _get_agent_mapping(to_number: str) -> dict:
-    """Get the full agent mapping dict for a Twilio number."""
-    clean = to_number.replace("whatsapp:", "").strip()
-    if clean in AGENT_MAPPINGS:
-        return AGENT_MAPPINGS[clean]
-    return {"api_key": DOGRAH_API_KEY, "trigger_path": DOGRAH_TRIGGER_PATH}
+async def _get_agent_config(to_number: str) -> tuple[str, str]:
+    """Resolve which API key + trigger to use for a given Twilio number."""
+    doc = await _get_agent_doc(to_number)
+    return doc["api_key"], doc["trigger_path"]
+
+
+async def _get_agent_mapping(to_number: str) -> dict:
+    """Get the full agent config dict for a Twilio number."""
+    try:
+        return await _get_agent_doc(to_number)
+    except ValueError:
+        return {}
+
+
+async def _migrate_env_agents_to_db() -> None:
+    """One-time migration: move AGENT_MAPPINGS from .env into MongoDB agents collection.
+
+    Runs at startup. If the agents collection already has documents, skip.
+    This ensures existing agents are preserved after the first deploy.
+    """
+    if agents_collection is None or not AGENT_MAPPINGS:
+        return
+    count = await agents_collection.count_documents({})
+    if count > 0:
+        logger.info(f"✅ Agents collection has {count} agent(s) — skipping migration")
+        return
+    docs = []
+    for phone_number, mapping in AGENT_MAPPINGS.items():
+        agent_name = mapping.get("agent_name", f"Agent {phone_number}")
+        collection_prefix = agent_name.lower().replace(" ", "_").replace("-", "_")
+        doc = {
+            "phone_number": phone_number,
+            "agent_name": agent_name,
+            "collection_prefix": collection_prefix,
+            "api_key": mapping.get("api_key", ""),
+            "trigger_path": mapping.get("trigger_path", ""),
+            "followups_enabled": mapping.get("followups_enabled", False),
+            "followup_delays": mapping.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS),
+            "greeting_message": mapping.get("greeting", ""),
+            "greeting_image_url": mapping.get("greeting_image_url", ""),
+            "greeting_window_hours": mapping.get("greeting_window_hours", 12),
+            "store_leads": mapping.get("store_leads", False),
+            "quota_enabled": mapping.get("quota_enabled", False),
+            "quota_limit": mapping.get("quota_limit", 500),
+            "quota_used": mapping.get("quota_used", 0),
+            "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "is_active": True,
+            "created_at": datetime.now(timezone.utc),
+        }
+        docs.append(doc)
+    if docs:
+        await agents_collection.insert_many(docs)
+        logger.info(f"✅ Migrated {len(docs)} agent(s) from .env to MongoDB")
 
 
 # Follow-up delays (in seconds). Per-agent override via "followup_delays" key.
@@ -112,6 +156,7 @@ mongo_client: AsyncIOMotorClient | None = None
 db = None
 sessions_collection = None
 chats_collection = None
+agents_collection = None
 
 # In-memory fallback (if MongoDB is unavailable)
 SESSIONS_STORE: dict = {}  # phone_number -> session dict
@@ -140,7 +185,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     """Initialize MongoDB connection and indexes."""
-    global mongo_client, db, sessions_collection, chats_collection
+    global mongo_client, db, sessions_collection, chats_collection, agents_collection
 
     try:
         mongo_client = AsyncIOMotorClient(
@@ -150,12 +195,17 @@ async def startup():
         db = mongo_client[MONGODB_DATABASE]
         sessions_collection = db["sessions"]
         chats_collection = db["chats"]
+        agents_collection = db["agents"]
 
         # Create indexes
         await sessions_collection.create_index("phone_number", unique=True)
         await chats_collection.create_index([("phone_number", 1), ("timestamp", 1)])
+        await agents_collection.create_index("phone_number", unique=True)
 
         logger.info(f"✅ Connected to MongoDB: {MONGODB_DATABASE}")
+
+        # One-time migration: .env AGENT_MAPPINGS → MongoDB agents collection
+        await _migrate_env_agents_to_db()
     except Exception as e:
         logger.warning(
             f"⚠️ MongoDB unavailable ({e}), using in-memory storage")
@@ -239,7 +289,7 @@ async def store_message(
         )
 
     # Invalidate conversations cache
-    CONVERSATIONS_CACHE["data"] = None
+    CONVERSATIONS_CACHE.clear()
 
 
 async def get_human_takeover_status(phone_number: str) -> bool:
@@ -267,7 +317,7 @@ async def set_human_takeover(phone_number: str, status: bool) -> None:
         SESSIONS_STORE[phone_number]["human_takeover"] = status
         SESSIONS_STORE[phone_number]["last_activity"] = now
 
-    CONVERSATIONS_CACHE["data"] = None
+    CONVERSATIONS_CACHE.clear()
 
 
 async def _reset_followup(phone_number: str) -> None:
@@ -315,7 +365,7 @@ async def _set_lead_status(phone_number: str, status: str) -> None:
         session = SESSIONS_STORE.get(phone_number)
         if session:
             session["lead_status"] = status
-    CONVERSATIONS_CACHE["data"] = None
+    CONVERSATIONS_CACHE.clear()
 
 
 async def _increment_followup(phone_number: str, stage: int) -> None:
@@ -406,6 +456,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
 
     lead_doc = {
         "phone_number": phone_number,
+        "agent_number": session.get("agent_number", "") if session else "",
         "patient_name": name,
         "concern": concern,
         "city_locality": city_locality,
@@ -438,6 +489,8 @@ async def whatsapp_webhook(
     Body: str = Form(""),
     Latitude: str = Form(None),
     Longitude: str = Form(None),
+    MediaUrl0: str = Form(None),
+    MediaContentType0: str = Form(None),
 ):
     """Twilio WhatsApp webhook handler.
 
@@ -451,7 +504,7 @@ async def whatsapp_webhook(
     sender = From  # e.g. "whatsapp:+919876543210"
     receiver = To  # e.g. "whatsapp:+14155551234"
 
-    # Handle location pins (Twilio sends lat/lng separately, not in Body)
+    # Handle WhatsApp location pins (Twilio sends lat/lng separately)
     if not user_message and Latitude and Longitude:
         user_message = f"https://maps.google.com/?q={Latitude},{Longitude}"
         logger.info(f"📍 Location pin from {sender}: {user_message}")
@@ -479,7 +532,7 @@ async def whatsapp_webhook(
 
     # Resolve which Dograh agent handles this number
     try:
-        api_key, trigger_path = _get_agent_config(receiver)
+        api_key, trigger_path = await _get_agent_config(receiver)
     except ValueError as e:
         logger.error(str(e))
         _send_twilio_reply(
@@ -487,6 +540,41 @@ async def whatsapp_webhook(
         )
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
+
+    # Check quota before calling Dograh
+    agent_doc = await _get_agent_mapping(receiver)
+    allowed, quota_reason = await check_quota(agent_doc)
+    if not allowed:
+        logger.warning(f"🚫 Quota exceeded for {receiver}: {quota_reason}")
+        _send_twilio_reply(sender, "Sorry, this service is temporarily unavailable. Please try again later.")
+        resp = MessagingResponse()
+        return Response(content=str(resp), media_type="application/xml")
+
+    # If lead already completed/inactive/not_qualified — re-engage with fresh greeting
+    if sessions_collection is not None:
+        existing_session = await sessions_collection.find_one({"phone_number": sender})
+        if existing_session and existing_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
+            old_status = existing_session.get("lead_status")
+            logger.info(f"🔄 Re-engaging {sender} (was {old_status}) — resetting session")
+            # Reset lead status and followup stage
+            await _set_lead_status(sender, "active")
+            await _reset_followup(sender)
+            # Send greeting + image (same as new user)
+            mapping = await _get_agent_mapping(receiver)
+            if mapping.get("greeting_message"):
+                image_url = mapping.get("greeting_image_url", "")
+                _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url)
+                await store_message(sender, "agent", mapping["greeting_message"], "ai")
+                await _mark_agent_replied(sender)
+                logger.info(f"👋 Re-engagement greeting sent to {sender}")
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
+
+    # Maps link interception — if user sends maps URL, handle completion directly
+    # Dograh's LLM sometimes fails to match edge conditions on maps URLs
+    # This is the reliable fallback: adapter detects it and marks completed
+    maps_keywords = ["maps.app.goo.gl", "maps.google.com", "goo.gl", "https://maps", "maps.app"]
+    user_sent_maps = any(kw in user_message.lower() for kw in maps_keywords)
 
     # Call Dograh's public text-chat endpoint
     dograh_response = await _send_to_dograh(
@@ -498,22 +586,49 @@ async def whatsapp_webhook(
     assistant_text = dograh_response["assistant_text"]
     is_completed = dograh_response["is_completed"]
 
-    # Send greeting if no agent message in the last 12 hours (new conversation)
-    mapping = _get_agent_mapping(receiver)
-    if assistant_text and mapping.get("greeting"):
+    # If user sent maps but Dograh didn't complete — force completion
+    if user_sent_maps and not is_completed:
+        # Check session is active (not already completed)
+        if sessions_collection is not None:
+            cur_session = await sessions_collection.find_one({"phone_number": sender})
+            if cur_session and cur_session.get("lead_status") == "active":
+                logger.info(f"📍 Maps link detected, Dograh didn't complete — forcing completion for {sender}")
+                is_completed = True
+
+    # Strip [SEND_EXACT]: prefix if Dograh returns it — user should never see this prefix
+    if assistant_text and assistant_text.startswith("[SEND_EXACT]:"):
+        assistant_text = assistant_text[len("[SEND_EXACT]:"):].strip()
+
+    # Send greeting if no agent message within greeting_window_hours (per-agent setting)
+    # When greeting is sent → skip Dograh reply for this message (greeting IS the response)
+    mapping = await _get_agent_mapping(receiver)
+    greeting_sent = False
+    if assistant_text and mapping.get("greeting_message"):
         should_greet = True
+        window_hours = mapping.get("greeting_window_hours", 12)
         if chats_collection is not None:
-            twelve_hours_ago = datetime.now(timezone.utc) - timedelta(hours=12)
-            recent_agent_msgs = await chats_collection.count_documents(
-                {"phone_number": sender, "sender": "agent",
-                    "timestamp": {"$gte": twelve_hours_ago}}
-            )
-            should_greet = recent_agent_msgs == 0
-            logger.debug(
-                f"Greeting check: {sender} has {recent_agent_msgs} agent msgs in last 12h, should_greet={should_greet}")
+            if window_hours == 0:
+                should_greet = True
+            else:
+                window_ago = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+                recent_agent_msgs = await chats_collection.count_documents(
+                    {"phone_number": sender, "sender": "agent",
+                        "timestamp": {"$gte": window_ago}}
+                )
+                should_greet = recent_agent_msgs == 0
+                logger.debug(
+                    f"Greeting check: {sender} has {recent_agent_msgs} agent msgs in last {window_hours}h, should_greet={should_greet}")
         if should_greet and not assistant_text.startswith("Greetings"):
-            _send_twilio_reply(sender, mapping["greeting"])
-            await store_message(sender, "agent", mapping["greeting"], "ai")
+            image_url = mapping.get("greeting_image_url", "")
+            _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url)
+            await store_message(sender, "agent", mapping["greeting_message"], "ai")
+            await _mark_agent_replied(sender)
+            greeting_sent = True
+            logger.info(f"👋 Greeting sent to {sender}{' (with image)' if image_url else ''} — skipping Dograh reply")
+
+    if greeting_sent:
+        resp = MessagingResponse()
+        return Response(content=str(resp), media_type="application/xml")
 
     # Check if the agent is requesting a human handoff
     if assistant_text and "TRANSFER_TO_HUMAN" in assistant_text:
@@ -531,51 +646,45 @@ async def whatsapp_webhook(
         return Response(content=str(resp), media_type="application/xml")
 
     # Send reply via Twilio API
+    # If forced completion from maps link — override Dograh's reply with completion message
+    if user_sent_maps and is_completed and assistant_text:
+        # Check if Dograh's reply is NOT the completion message (i.e. wrong reply)
+        completion_indicators = ["received your appointment", "confirm your appointment", "reach out to you soon", "take care"]
+        is_completion_msg = any(kw in assistant_text.lower() for kw in completion_indicators)
+        if not is_completion_msg:
+            # Override with completion message from agent config or default
+            completion_msg = mapping.get("completion_message", "") or "We've received your appointment request! We'll confirm your appointment shortly and our executive will reach out to you soon. Take care! 🙏"
+            assistant_text = completion_msg
+            logger.info(f"📍 Overriding Dograh reply with completion message for {sender}")
+
     if assistant_text:
         _send_twilio_reply(sender, assistant_text)
         await store_message(sender, "agent", assistant_text, "ai")
         await _mark_agent_replied(sender)
+        # Consume quota after successful reply
+        clean_receiver = receiver.replace("whatsapp:", "").strip()
+        await consume_quota(clean_receiver)
 
-        # Use Dograh's is_completed flag (workflow transitioned to end node)
+        # Use Dograh's is_completed flag ONLY — no keyword detection
+        # Keywords caused false completions when FAQ answers matched completion phrases
         if is_completed:
             await _set_lead_status(sender, "completed")
             if mapping.get("store_leads"):
                 await _store_lead_from_chat(sender)
             logger.info(
                 f"✅ Lead {sender} marked COMPLETED (is_completed=True)")
-        else:
-            # Fallback: keyword detection for end states
-            text_lower = assistant_text.lower()
-            if any(kw in text_lower for kw in [
-                "therapist will be assigned",
-                "noted your location",
-                "assign a therapist",
-                "will assign",
-                "session is now booked",
-                "confirm your appointment",
-                "confirm the appointment",
-                "reach out to you soon",
-                "thank you for sharing the location",
-                "thank you for sharing your location",
-            ]):
-                await _set_lead_status(sender, "completed")
-                if mapping.get("store_leads"):
-                    await _store_lead_from_chat(sender)
-                logger.info(
-                    f"✅ Lead {sender} marked COMPLETED (keyword match)")
-            elif any(kw in text_lower for kw in [
-                "wishing you good health",
-                "no worries at all",
-                "feel free to reach out anytime",
-                "change your mind",
-                "wish you well",
-            ]):
-                await _set_lead_status(sender, "not_qualified")
-                logger.info(f"🚫 Lead {sender} marked NOT_QUALIFIED")
     else:
-        fallback = "I'm sorry, I couldn't process your message. Please try again."
-        _send_twilio_reply(sender, fallback)
-        await store_message(sender, "agent", fallback, "ai")
+        # assistant_text is empty/null
+        # If is_completed=True, workflow ended silently — don't send fallback
+        if is_completed:
+            await _set_lead_status(sender, "completed")
+            if mapping.get("store_leads"):
+                await _store_lead_from_chat(sender)
+            logger.info(f"✅ Lead {sender} marked COMPLETED (silent completion)")
+        else:
+            fallback = "I'm sorry, I couldn't process your message. Please try again."
+            _send_twilio_reply(sender, fallback)
+            await store_message(sender, "agent", fallback, "ai")
 
     resp = MessagingResponse()
     return Response(content=str(resp), media_type="application/xml")
@@ -611,19 +720,37 @@ def _split_message(body: str, max_len: int = 1500) -> list[str]:
     return chunks
 
 
-def _send_twilio_reply(to: str, body: str) -> None:
+def _send_twilio_reply(to: str, body: str, media_url: str = "") -> None:
     """Send a WhatsApp message via Twilio API.
 
-    Automatically splits messages exceeding WhatsApp's 1600 char limit
-    into multiple messages.
+    If media_url is provided, sends image + body as a single message (caption).
+    Otherwise splits long text into chunks.
     """
     if not twilio_client:
         logger.error("Twilio client not configured — cannot send reply")
         return
 
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
-    chunks = _split_message(body)
 
+    # Send image + caption as ONE message
+    if media_url:
+        try:
+            msg = twilio_client.messages.create(
+                from_=from_number,
+                to=to,
+                media_url=[media_url],
+                body=body,
+            )
+            logger.info(f"🖼️ Image+caption sent to {to} (SID: {msg.sid})")
+        except Exception as e:
+            logger.error(f"❌ Failed to send image to {to}: {e}")
+            # Fallback: send text only
+            if body:
+                _send_twilio_reply(to, body)
+        return
+
+    # Text only — split if needed
+    chunks = _split_message(body)
     for chunk in chunks:
         try:
             message = twilio_client.messages.create(
@@ -692,9 +819,34 @@ async def _send_to_dograh(
         return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
 
 
-# ---------------------------------------------------------------------------
-# Follow-up Scheduler
-# ---------------------------------------------------------------------------
+async def check_quota(agent_doc: dict) -> tuple[bool, str]:
+    """Check if agent has quota remaining. Returns (allowed, reason)."""
+    if not agent_doc.get("quota_enabled", False):
+        return True, ""
+    limit = agent_doc.get("quota_limit", 500)
+    used = agent_doc.get("quota_used", 0)
+    if used >= limit:
+        return False, f"Quota exceeded ({used}/{limit} messages used)"
+    return True, ""
+
+
+async def consume_quota(phone_number: str) -> None:
+    """Increment quota_used for the agent after a successful message."""
+    if agents_collection is None:
+        return
+    await agents_collection.update_one(
+        {"phone_number": phone_number},
+        {"$inc": {"quota_used": 1}},
+    )
+    # Log current usage
+    doc = await agents_collection.find_one({"phone_number": phone_number})
+    if doc and doc.get("quota_enabled"):
+        used = doc.get("quota_used", 0)
+        limit = doc.get("quota_limit", 500)
+        logger.debug(f"💳 Quota: {used}/{limit} msgs used for '{doc.get('agent_name')}'")
+
+
+
 
 FOLLOWUP_PROMPTS = [
     "[SYSTEM: The user has not replied for a while. Send a gentle follow-up based on where the conversation left off. If you were waiting for their name, ask for it again. If waiting for location, remind them. If waiting for confirmation, ask again. Keep it short, friendly, 1-2 lines. Don't repeat your exact last message — rephrase it.]",
@@ -708,15 +860,7 @@ async def _followup_loop() -> None:
 
     Runs every 60s. Only fires for agents with followups_enabled=true.
     """
-    # Log startup info
-    followup_agents = [n for n, m in AGENT_MAPPINGS.items()
-                       if m.get("followups_enabled")]
-    logger.info(
-        f"🔄 Follow-up scheduler started. Enabled agents: {followup_agents}")
-    greeting_agents = {n: m.get("greeting")
-                       for n, m in AGENT_MAPPINGS.items() if m.get("greeting")}
-    logger.info(f"👋 Greeting configured: {greeting_agents}")
-
+    logger.info("🔄 Follow-up scheduler started.")
     while True:
         await asyncio.sleep(60)
         try:
@@ -729,19 +873,28 @@ async def _process_followups() -> None:
     """Scan sessions and send follow-ups where due."""
     now = datetime.now(timezone.utc)
 
-    # Build set of agent numbers that have followups enabled
-    followup_agents = set()
-    for number, mapping in AGENT_MAPPINGS.items():
-        if mapping.get("followups_enabled"):
-            followup_agents.add(number)
+    # Load enabled agents from MongoDB agents collection
+    if agents_collection is not None:
+        agent_docs = await agents_collection.find(
+            {"followups_enabled": True, "is_active": True}
+        ).to_list(length=100)
+    else:
+        # In-memory fallback: use AGENT_MAPPINGS
+        agent_docs = [
+            {**v, "phone_number": k}
+            for k, v in AGENT_MAPPINGS.items()
+            if v.get("followups_enabled")
+        ]
 
-    if not followup_agents:
+    if not agent_docs:
         return
+
+    followup_agents = {doc["phone_number"] for doc in agent_docs}
+    agent_map = {doc["phone_number"]: doc for doc in agent_docs}
 
     # Query sessions that are active and have an agent_number in followup_agents
     if sessions_collection is not None:
         query = {
-            # Sessions without lead_status are also "active" (old sessions)
             "lead_status": {"$in": ["active", None]},
             "human_takeover": {"$ne": True},
             "agent_number": {"$regex": "|".join(
@@ -749,13 +902,11 @@ async def _process_followups() -> None:
             )},
         }
         sessions = await sessions_collection.find(query).to_list(length=500)
-        # Also include sessions that don't have lead_status field at all
         no_status_query = {
             "lead_status": {"$exists": False},
             "human_takeover": {"$ne": True},
         }
         no_status_sessions = await sessions_collection.find(no_status_query).to_list(length=500)
-        # Merge, dedup by phone_number
         seen = {s["phone_number"] for s in sessions}
         for s in no_status_sessions:
             if s["phone_number"] not in seen:
@@ -782,16 +933,15 @@ async def _process_followups() -> None:
         if not last_reply or stage >= len(FOLLOWUP_PROMPTS):
             continue
 
-        # Get delays for this agent — if agent_number is missing, use first followup-enabled agent
+        # Get agent doc for this session
         clean_agent = agent_number.replace("whatsapp:", "").strip()
-        mapping = AGENT_MAPPINGS.get(clean_agent, {})
-        if not mapping.get("followups_enabled"):
-            # Try to find a matching agent from the enabled set
+        mapping = agent_map.get(clean_agent)
+        if not mapping:
             if len(followup_agents) == 1:
-                clean_agent = next(iter(followup_agents))
-                mapping = AGENT_MAPPINGS[clean_agent]
+                mapping = next(iter(agent_map.values()))
             else:
                 continue
+
         delays = mapping.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS)
 
         if stage >= len(delays):
@@ -801,7 +951,6 @@ async def _process_followups() -> None:
         if isinstance(last_reply, str):
             last_reply = datetime.fromisoformat(
                 last_reply.replace("Z", "+00:00"))
-        # Handle naive datetimes from old sessions
         if last_reply.tzinfo is None:
             last_reply = last_reply.replace(tzinfo=timezone.utc)
 
@@ -813,6 +962,14 @@ async def _process_followups() -> None:
         if elapsed < delays[stage]:
             continue
 
+        # Skip if lead already completed/inactive/not_qualified
+        current_session = None
+        if sessions_collection is not None:
+            current_session = await sessions_collection.find_one({"phone_number": phone_number})
+        if current_session and current_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
+            logger.debug(f"⏭️ Skipping follow-up for {phone_number} — lead_status={current_session.get('lead_status')}")
+            continue
+
         # Time to send follow-up
         logger.info(
             f"⏰ Follow-up {stage + 1} for {phone_number} "
@@ -820,26 +977,36 @@ async def _process_followups() -> None:
         )
 
         try:
-            api_key, trigger_path = mapping["api_key"], mapping["trigger_path"]
+            api_key = mapping["api_key"]
+            trigger_path = mapping["trigger_path"]
         except KeyError:
             continue
 
-        # Send synthetic message to Dograh to get context-aware follow-up
-        dograh_response = await _send_to_dograh(
-            api_key=api_key,
-            trigger_path=trigger_path,
-            session_key=phone_number,
-            text=FOLLOWUP_PROMPTS[stage],
-        )
-        followup_text = dograh_response["assistant_text"]
+        # Check if custom message set for this stage BEFORE calling Dograh
+        followup_messages = mapping.get("followup_messages", [])
+        custom_text = followup_messages[stage].strip() if stage < len(followup_messages) and followup_messages[stage] else ""
 
-        if followup_text:
-            _send_twilio_reply(phone_number, followup_text)
-            await store_message(phone_number, "agent", followup_text, "followup")
+        if custom_text:
+            # Custom text set — send directly, skip Dograh entirely (don't touch session)
+            logger.info(f"📝 Using custom follow-up {stage + 1} for {phone_number}")
+            _send_twilio_reply(phone_number, custom_text)
+            await store_message(phone_number, "agent", custom_text, "followup")
             await _mark_agent_replied(phone_number)
         else:
-            logger.warning(
-                f"Dograh returned no text for follow-up {stage + 1}")
+            # No custom text — send AI generated through Dograh
+            dograh_response = await _send_to_dograh(
+                api_key=api_key,
+                trigger_path=trigger_path,
+                session_key=phone_number,
+                text=FOLLOWUP_PROMPTS[stage],
+            )
+            followup_text = dograh_response["assistant_text"]
+            if followup_text:
+                _send_twilio_reply(phone_number, followup_text)
+                await store_message(phone_number, "agent", followup_text, "followup")
+                await _mark_agent_replied(phone_number)
+            else:
+                logger.warning(f"Dograh returned no text for follow-up {stage + 1}")
 
         new_stage = stage + 1
         await _increment_followup(phone_number, new_stage)
@@ -857,48 +1024,60 @@ async def _process_followups() -> None:
 
 
 @app.get("/conversations")
-async def get_conversations():
-    """Get all conversations for the dashboard (cached 30s)."""
+async def get_conversations(agent_number: str = ""):
+    """Get all conversations for the dashboard (cached 30s). Optionally filter by agent_number."""
     now = time.monotonic()
-    if CONVERSATIONS_CACHE["data"] is not None and now < CONVERSATIONS_CACHE["expires_at"]:
-        return CONVERSATIONS_CACHE["data"]
+    cache_key = agent_number or "all"
+    if CONVERSATIONS_CACHE.get(cache_key) and now < CONVERSATIONS_CACHE.get(f"{cache_key}_expires", 0):
+        return CONVERSATIONS_CACHE[cache_key]
 
     conversations = []
 
     if sessions_collection is not None:
-        async for session in sessions_collection.find({}):
+        query: dict = {}
+        if agent_number:
+            clean = agent_number.replace("whatsapp:", "").strip()
+            query["agent_number"] = {"$in": [clean, f"whatsapp:{clean}"]}
+
+        async for session in sessions_collection.find(query):
             phone_number = session["phone_number"]
             last_chat = await chats_collection.find_one(
                 {"phone_number": phone_number}, sort=[("timestamp", -1)]
             )
-
             timestamp_str = ""
             if last_chat and last_chat.get("timestamp"):
                 timestamp_str = last_chat["timestamp"].isoformat() + "Z"
-
-            conversations.append(
-                {
-                    "phone_number": phone_number,
-                    "human_takeover": session.get("human_takeover", False),
-                    "last_message": last_chat["content"] if last_chat else "",
-                    "last_message_time": timestamp_str,
-                }
-            )
+            conversations.append({
+                "phone_number": phone_number,
+                "agent_number": session.get("agent_number", "").replace("whatsapp:", ""),
+                "human_takeover": session.get("human_takeover", False),
+                "lead_status": session.get("lead_status", "active"),
+                "last_message": last_chat["content"] if last_chat else "",
+                "last_message_time": timestamp_str,
+            })
     else:
         for phone_number, session in SESSIONS_STORE.items():
+            if agent_number:
+                clean = agent_number.replace("whatsapp:", "").strip()
+                ag = session.get("agent_number", "").replace("whatsapp:", "")
+                if ag != clean:
+                    continue
             messages = MESSAGE_STORE.get(phone_number, [])
             last_msg = messages[-1] if messages else None
-            conversations.append(
-                {
-                    "phone_number": phone_number,
-                    "human_takeover": session.get("human_takeover", False),
-                    "last_message": last_msg["content"] if last_msg else "",
-                    "last_message_time": last_msg["timestamp"] if last_msg else "",
-                }
-            )
+            conversations.append({
+                "phone_number": phone_number,
+                "agent_number": session.get("agent_number", "").replace("whatsapp:", ""),
+                "human_takeover": session.get("human_takeover", False),
+                "lead_status": session.get("lead_status", "active"),
+                "last_message": last_msg["content"] if last_msg else "",
+                "last_message_time": last_msg["timestamp"] if last_msg else "",
+            })
 
-    CONVERSATIONS_CACHE["data"] = conversations
-    CONVERSATIONS_CACHE["expires_at"] = now + 30
+    # Sort newest first
+    conversations.sort(key=lambda x: x.get("last_message_time", ""), reverse=True)
+
+    CONVERSATIONS_CACHE[cache_key] = conversations
+    CONVERSATIONS_CACHE[f"{cache_key}_expires"] = now + 30
     return conversations
 
 
@@ -965,17 +1144,23 @@ async def release_conversation(request: Request):
 
 @app.post("/webhook/lead-data")
 async def receive_lead_data(request: Request):
-    """Webhook endpoint called by Dograh's webhook node when a conversation completes.
-
-    Receives extracted variables (patient_name, concern, city, locality,
-    user_location, notes) and stores them in MongoDB collection 'leads'.
-    """
+    """Webhook endpoint called by Dograh's webhook node when a conversation completes."""
     data = await request.json()
     logger.info(f"📋 Lead data received: {json.dumps(data)[:200]}")
 
-    # Dograh webhook payload uses gathered_context for extraction vars
     gathered = data.get("gathered_context", {})
     initial = data.get("initial_context", {})
+
+    phone_number = initial.get("phone_number", "")
+
+    # Resolve agent_number from sessions collection using the user's phone number
+    agent_number = ""
+    if phone_number and sessions_collection is not None:
+        session = await sessions_collection.find_one({
+            "phone_number": {"$in": [phone_number, f"whatsapp:{phone_number}"]}
+        })
+        if session:
+            agent_number = session.get("agent_number", "").replace("whatsapp:", "")
 
     lead_doc = {
         "patient_name": gathered.get("patient_name", ""),
@@ -984,7 +1169,8 @@ async def receive_lead_data(request: Request):
         "locality": gathered.get("locality", ""),
         "user_location": gathered.get("user_location", ""),
         "notes": gathered.get("notes", ""),
-        "phone_number": initial.get("phone_number", ""),
+        "phone_number": phone_number,
+        "agent_number": agent_number,
         "workflow_run_id": data.get("workflow_run_id", ""),
         "created_at": datetime.now(timezone.utc),
     }
@@ -992,8 +1178,7 @@ async def receive_lead_data(request: Request):
     if db is not None:
         leads_collection = db["leads"]
         await leads_collection.insert_one(lead_doc)
-        logger.info(
-            f"💾 Lead stored: {lead_doc['patient_name']} - {lead_doc['concern']}")
+        logger.info(f"💾 Lead stored: {lead_doc['patient_name']} - {lead_doc['concern']} - agent: {agent_number}")
     else:
         logger.warning("MongoDB unavailable — lead data not stored")
 
@@ -1045,3 +1230,185 @@ async def send_message(request: Request):
                 "error_code": "63016",
             }
         raise HTTPException(status_code=500, detail=error_str)
+
+
+# ---------------------------------------------------------------------------
+# Agents CRUD endpoints (for dashboard)
+# ---------------------------------------------------------------------------
+
+
+def _make_agent_prefix(agent_name: str) -> str:
+    """Generate collection prefix from agent name."""
+    import re
+    prefix = agent_name.lower().strip()
+    prefix = re.sub(r"[^a-z0-9]+", "_", prefix)
+    prefix = prefix.strip("_")
+    return prefix
+
+
+def _serialize_agent(doc: dict) -> dict:
+    """Serialize an agent document for JSON response (remove MongoDB _id)."""
+    doc = dict(doc)
+    doc.pop("_id", None)
+    if doc.get("created_at"):
+        doc["created_at"] = doc["created_at"].isoformat() + "Z"
+    if doc.get("updated_at"):
+        doc["updated_at"] = doc["updated_at"].isoformat() + "Z"
+    return doc
+
+
+@app.get("/agents")
+async def list_agents():
+    """List all agents."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    docs = await agents_collection.find({}).to_list(length=200)
+    return [_serialize_agent(d) for d in docs]
+
+
+@app.post("/agents")
+async def create_agent(request: Request):
+    """Create a new agent."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    data = await request.json()
+
+    phone_number = data.get("phone_number", "").strip()
+    agent_name = data.get("agent_name", "").strip()
+    if not phone_number or not agent_name:
+        raise HTTPException(status_code=400, detail="phone_number and agent_name are required")
+
+    existing = await agents_collection.find_one({"phone_number": phone_number})
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Agent with number {phone_number} already exists")
+
+    collection_prefix = data.get("collection_prefix") or _make_agent_prefix(agent_name)
+
+    doc = {
+        "phone_number": phone_number,
+        "agent_name": agent_name,
+        "collection_prefix": collection_prefix,
+        "api_key": data.get("api_key", ""),
+        "trigger_path": data.get("trigger_path", ""),
+        "followups_enabled": data.get("followups_enabled", False),
+        "followup_delays": data.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS),
+        "followup_messages": data.get("followup_messages", []),
+        "greeting_message": data.get("greeting_message", ""),
+        "greeting_image_url": data.get("greeting_image_url", ""),
+        "greeting_window_hours": data.get("greeting_window_hours", 12),
+        "completion_message": data.get("completion_message", ""),
+        "store_leads": data.get("store_leads", False),
+        "quota_enabled": data.get("quota_enabled", False),
+        "quota_limit": data.get("quota_limit", 500),
+        "quota_used": 0,
+        "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "is_active": data.get("is_active", True),
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await agents_collection.insert_one(doc)
+    logger.info(f"✅ Agent created: {agent_name} ({phone_number})")
+    return _serialize_agent(doc)
+
+
+@app.get("/agents/{phone_number:path}")
+async def get_agent(phone_number: str):
+    """Get a single agent by phone number."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    phone_number = phone_number.replace("%2B", "+").strip()
+    doc = await agents_collection.find_one({"phone_number": phone_number})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return _serialize_agent(doc)
+
+
+@app.put("/agents/{phone_number:path}")
+async def update_agent(phone_number: str, request: Request):
+    """Update an agent's config."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    phone_number = phone_number.replace("%2B", "+").strip()
+    data = await request.json()
+
+    allowed_fields = {
+        "agent_name", "api_key", "trigger_path",
+        "followups_enabled", "followup_delays", "followup_messages",
+        "greeting_message", "greeting_image_url", "greeting_window_hours",
+        "completion_message", "store_leads", "is_active",
+        "quota_enabled", "quota_limit",
+    }
+    update = {k: v for k, v in data.items() if k in allowed_fields}
+    if not update:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    update["updated_at"] = datetime.now(timezone.utc)
+    result = await agents_collection.update_one(
+        {"phone_number": phone_number},
+        {"$set": update},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    doc = await agents_collection.find_one({"phone_number": phone_number})
+    logger.info(f"✅ Agent updated: {phone_number} — fields: {list(update.keys())}")
+    return _serialize_agent(doc)
+
+
+@app.delete("/agents/{phone_number:path}")
+async def delete_agent(phone_number: str):
+    """Delete an agent."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    phone_number = phone_number.replace("%2B", "+").strip()
+    result = await agents_collection.delete_one({"phone_number": phone_number})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    logger.info(f"🗑️ Agent deleted: {phone_number}")
+    return {"success": True, "message": f"Agent {phone_number} deleted"}
+
+
+@app.post("/agents/{phone_number:path}/reset-quota")
+async def reset_agent_quota(phone_number: str):
+    """Reset quota_used to 0 for an agent (e.g. after payment/renewal)."""
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    phone_number = phone_number.replace("%2B", "+").strip()
+    result = await agents_collection.update_one(
+        {"phone_number": phone_number},
+        {"$set": {
+            "quota_used": 0,
+            "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "updated_at": datetime.now(timezone.utc),
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    logger.info(f"🔄 Quota reset for {phone_number}")
+    return {"success": True, "message": f"Quota reset for {phone_number}"}
+
+
+# ---------------------------------------------------------------------------
+# Leads endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/leads")
+async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = ""):
+    """Get all captured leads, newest first. Optionally filter by agent_number."""
+    if db is None:
+        return []
+    leads_collection = db["leads"]
+    query: dict = {}
+    if agent_number:
+        clean = agent_number.replace("whatsapp:", "").strip()
+        # Match exact number OR whatsapp-prefixed OR empty (legacy leads without agent_number)
+        query["agent_number"] = {"$in": [clean, f"whatsapp:{clean}"]}
+    cursor = leads_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    leads = await cursor.to_list(length=limit)
+    result = []
+    for lead in leads:
+        lead.pop("_id", None)
+        if lead.get("created_at"):
+            lead["created_at"] = lead["created_at"].isoformat() + "Z"
+        result.append(lead)
+    return result
