@@ -302,13 +302,24 @@ async def get_human_takeover_status(phone_number: str) -> bool:
         return session.get("human_takeover", False) if session else False
 
 
-async def set_human_takeover(phone_number: str, status: bool) -> None:
-    """Set human takeover status for a conversation."""
+async def set_human_takeover(phone_number: str, status: bool, takeover_context: str = "") -> None:
+    """Set human takeover status for a conversation.
+    
+    When activating (status=True), stores takeover_context so AI can resume
+    from the right point when human releases back to AI.
+    """
     now = datetime.now(timezone.utc)
+    update_fields: dict = {"human_takeover": status, "last_activity": now}
+    if status and takeover_context:
+        update_fields["takeover_context"] = takeover_context
+    elif not status:
+        # Clearing takeover — don't wipe context yet, release handler uses it
+        pass
+
     if sessions_collection is not None:
         await sessions_collection.update_one(
             {"phone_number": phone_number},
-            {"$set": {"human_takeover": status, "last_activity": now}},
+            {"$set": update_fields},
             upsert=True,
         )
     else:
@@ -316,6 +327,8 @@ async def set_human_takeover(phone_number: str, status: bool) -> None:
             SESSIONS_STORE[phone_number] = {"phone_number": phone_number}
         SESSIONS_STORE[phone_number]["human_takeover"] = status
         SESSIONS_STORE[phone_number]["last_activity"] = now
+        if status and takeover_context:
+            SESSIONS_STORE[phone_number]["takeover_context"] = takeover_context
 
     CONVERSATIONS_CACHE.clear()
 
@@ -550,6 +563,51 @@ async def whatsapp_webhook(
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
 
+    # Check if user is responding to a pending handoff confirmation (BEFORE Dograh call)
+    if sessions_collection is not None:
+        pending_session = await sessions_collection.find_one({"phone_number": sender})
+        if pending_session and pending_session.get("pending_handoff"):
+            msg_lower = user_message.lower().strip()
+            yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
+            no_words  = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
+            is_yes = any(w in msg_lower for w in yes_words)
+            is_no  = any(w in msg_lower for w in no_words)
+
+            if is_yes:
+                takeover_ctx = pending_session.get("takeover_context", "")
+                await sessions_collection.update_one(
+                    {"phone_number": sender},
+                    {"$set": {"pending_handoff": False}}
+                )
+                await set_human_takeover(sender, True, takeover_context=takeover_ctx)
+                confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
+                _send_twilio_reply(sender, confirm_reply)
+                await store_message(sender, "agent", confirm_reply, "system")
+                logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
+
+            elif is_no:
+                await sessions_collection.update_one(
+                    {"phone_number": sender},
+                    {"$set": {"pending_handoff": False}, "$unset": {"takeover_context": ""}}
+                )
+                no_reply = "No problem! Our standard fee is Rs.800 per session. Would you like to proceed with booking?"
+                _send_twilio_reply(sender, no_reply)
+                await store_message(sender, "agent", no_reply, "ai")
+                await _mark_agent_replied(sender)
+                logger.info(f"❌ User declined handoff — AI continues for {sender}")
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
+
+            else:
+                retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
+                _send_twilio_reply(sender, retry_msg)
+                await store_message(sender, "agent", retry_msg, "system")
+                await _mark_agent_replied(sender)
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
+
     # If lead already completed/inactive/not_qualified — re-engage with fresh greeting
     if sessions_collection is not None:
         existing_session = await sessions_collection.find_one({"phone_number": sender})
@@ -599,25 +657,25 @@ async def whatsapp_webhook(
     if assistant_text and assistant_text.startswith("[SEND_EXACT]:"):
         assistant_text = assistant_text[len("[SEND_EXACT]:"):].strip()
 
-    # Send greeting if no agent message within greeting_window_hours (per-agent setting)
-    # When greeting is sent → skip Dograh reply for this message (greeting IS the response)
+    # Send greeting only on the very first message ever in this conversation.
+    # We check the total number of agent messages in the entire chat history —
+    # NOT a time window. This prevents re-greeting mid-conversation if the user
+    # goes quiet for an hour and comes back.
     mapping = await _get_agent_mapping(receiver)
     greeting_sent = False
     if assistant_text and mapping.get("greeting_message"):
-        should_greet = True
-        window_hours = mapping.get("greeting_window_hours", 12)
+        should_greet = False
         if chats_collection is not None:
-            if window_hours == 0:
-                should_greet = True
-            else:
-                window_ago = datetime.now(timezone.utc) - timedelta(hours=window_hours)
-                recent_agent_msgs = await chats_collection.count_documents(
-                    {"phone_number": sender, "sender": "agent",
-                        "timestamp": {"$gte": window_ago}}
-                )
-                should_greet = recent_agent_msgs == 0
-                logger.debug(
-                    f"Greeting check: {sender} has {recent_agent_msgs} agent msgs in last {window_hours}h, should_greet={should_greet}")
+            total_agent_msgs = await chats_collection.count_documents(
+                {"phone_number": sender, "sender": "agent"}
+            )
+            should_greet = total_agent_msgs == 0
+            logger.debug(
+                f"Greeting check: {sender} has {total_agent_msgs} agent msgs total, should_greet={should_greet}")
+        else:
+            # In-memory fallback — greet if no messages stored at all
+            should_greet = len(MESSAGE_STORE.get(sender, [])) == 0
+
         if should_greet and not assistant_text.startswith("Greetings"):
             image_url = mapping.get("greeting_image_url", "")
             _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url)
@@ -632,18 +690,85 @@ async def whatsapp_webhook(
 
     # Check if the agent is requesting a human handoff
     if assistant_text and "TRANSFER_TO_HUMAN" in assistant_text:
-        # Activate human takeover mode
-        await set_human_takeover(sender, True)
-        handoff_msg = (
-            "Connecting you to a support executive... "
-            "Someone from our team will be with you shortly. 🙏"
+        # Strip TRANSFER_TO_HUMAN from the message
+        clean_text = assistant_text.replace("TRANSFER_TO_HUMAN", "").strip()
+
+        # Build takeover context for later resume
+        takeover_context = (
+            f"The user was in the middle of a conversation. "
+            f"Last AI message before handoff: {clean_text or 'Pricing/discount discussion'}. "
+            f"When AI resumes, continue from where the conversation was — "
+            f"do not restart from the beginning."
         )
-        _send_twilio_reply(sender, handoff_msg)
-        await store_message(sender, "agent", handoff_msg, "system")
-        logger.info(f"🔀 Human handoff triggered for {sender}")
+
+        # Store pending handoff — don't activate yet, ask user first
+        if sessions_collection is not None:
+            await sessions_collection.update_one(
+                {"phone_number": sender},
+                {"$set": {
+                    "pending_handoff": True,
+                    "takeover_context": takeover_context,
+                }},
+                upsert=True,
+            )
+
+        # Ask user for confirmation
+        confirm_msg = (
+            "I'd like to connect you with our team executive who can assist you better. "
+            "Would you like me to transfer you to an executive? (Yes/No)"
+        )
+        _send_twilio_reply(sender, confirm_msg)
+        await store_message(sender, "agent", confirm_msg, "system")
+        await _mark_agent_replied(sender)
+        logger.info(f"🔀 Pending handoff — confirmation requested for {sender}")
 
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
+
+    # Check if user is responding to a pending handoff confirmation
+    if sessions_collection is not None:
+        current_session = await sessions_collection.find_one({"phone_number": sender})
+        if current_session and current_session.get("pending_handoff"):
+            # Check user's response
+            msg_lower = user_message.lower().strip()
+            yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
+            no_words = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
+
+            is_yes = any(w in msg_lower for w in yes_words)
+            is_no  = any(w in msg_lower for w in no_words)
+
+            if is_yes:
+                # User confirmed — activate human takeover
+                takeover_context = current_session.get("takeover_context", "")
+                await sessions_collection.update_one(
+                    {"phone_number": sender},
+                    {"$set": {"pending_handoff": False}}
+                )
+                await set_human_takeover(sender, True, takeover_context=takeover_context)
+                confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
+                _send_twilio_reply(sender, confirm_reply)
+                await store_message(sender, "agent", confirm_reply, "system")
+                logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
+
+            elif is_no:
+                # User declined — clear pending handoff and resume flow
+                await sessions_collection.update_one(
+                    {"phone_number": sender},
+                    {"$set": {"pending_handoff": False}, "$unset": {"takeover_context": ""}}
+                )
+                # Resume from where they were — send back to Dograh
+                logger.info(f"❌ User declined handoff — resuming AI flow for {sender}")
+                # Fall through to normal Dograh call below with original message
+            else:
+                # Unclear response — ask again
+                retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
+                _send_twilio_reply(sender, retry_msg)
+                await store_message(sender, "agent", retry_msg, "system")
+                await _mark_agent_replied(sender)
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
 
     # Send reply via Twilio API
     # If forced completion from maps link — override Dograh's reply with completion message
@@ -720,9 +845,10 @@ def _split_message(body: str, max_len: int = 1500) -> list[str]:
     return chunks
 
 
-def _send_twilio_reply(to: str, body: str, media_url: str = "") -> None:
+def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str = "") -> None:
     """Send a WhatsApp message via Twilio API.
 
+    If content_sid is provided, sends as a WhatsApp Template (bypasses 24h window).
     If media_url is provided, sends image + body as a single message (caption).
     Otherwise splits long text into chunks.
     """
@@ -731,6 +857,19 @@ def _send_twilio_reply(to: str, body: str, media_url: str = "") -> None:
         return
 
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+
+    # Template message — bypasses 24h window restriction
+    if content_sid:
+        try:
+            msg = twilio_client.messages.create(
+                from_=from_number,
+                to=to,
+                content_sid=content_sid,
+            )
+            logger.info(f"📋 Template sent to {to} (SID: {msg.sid}, template: {content_sid})")
+        except Exception as e:
+            logger.error(f"❌ Failed to send template to {to}: {e}")
+        return
 
     # Send image + caption as ONE message
     if media_url:
@@ -744,7 +883,6 @@ def _send_twilio_reply(to: str, body: str, media_url: str = "") -> None:
             logger.info(f"🖼️ Image+caption sent to {to} (SID: {msg.sid})")
         except Exception as e:
             logger.error(f"❌ Failed to send image to {to}: {e}")
-            # Fallback: send text only
             if body:
                 _send_twilio_reply(to, body)
         return
@@ -956,8 +1094,8 @@ async def _process_followups() -> None:
 
         elapsed = (now - last_reply).total_seconds()
 
-        # Skip stale sessions (idle > 24h) — these are old/abandoned
-        if elapsed > 86400:
+        # Skip truly stale sessions (idle > 7 days) — definitely abandoned
+        if elapsed > 86400 * 7:
             continue
         if elapsed < delays[stage]:
             continue
@@ -982,18 +1120,56 @@ async def _process_followups() -> None:
         except KeyError:
             continue
 
-        # Check if custom message set for this stage BEFORE calling Dograh
+        # Get follow-up config for this stage
+        # followup_messages is list of {message: str, template_sid: str}
+        # Supports legacy list[str] format for backwards compatibility
         followup_messages = mapping.get("followup_messages", [])
-        custom_text = followup_messages[stage].strip() if stage < len(followup_messages) and followup_messages[stage] else ""
+        followup_item: dict = {}
+        if stage < len(followup_messages):
+            item = followup_messages[stage]
+            if isinstance(item, dict):
+                followup_item = item
+            elif isinstance(item, str):
+                # Legacy format — treat as custom message
+                followup_item = {"message": item, "template_sid": ""}
 
-        if custom_text:
-            # Custom text set — send directly, skip Dograh entirely (don't touch session)
+        custom_text  = (followup_item.get("message") or "").strip()
+        template_sid = (followup_item.get("template_sid") or "").strip()
+        is_over_24h  = delays[stage] >= 86400
+
+        if is_over_24h:
+            # ≥ 24h — template REQUIRED
+            if not template_sid:
+                logger.warning(
+                    f"⏭️ Skipping follow-up {stage + 1} for {phone_number} — "
+                    f"delay ≥24h ({delays[stage]}s) but no template_sid set. "
+                    f"Add a Twilio Content SID in the dashboard."
+                )
+                # Still increment stage so we don't retry this one forever
+                await _increment_followup(phone_number, stage + 1)
+                continue
+            # Send via Twilio template
+            logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (delay={delays[stage]}s ≥24h)")
+            _send_twilio_reply(phone_number, "", content_sid=template_sid)
+            await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
+            await _mark_agent_replied(phone_number)
+
+        elif template_sid:
+            # < 24h, template optionally set — use it
+            logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (optional, <24h)")
+            _send_twilio_reply(phone_number, "", content_sid=template_sid)
+            await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
+            await _mark_agent_replied(phone_number)
+
+        elif custom_text:
+            # < 24h, custom text — send directly, skip Dograh
             logger.info(f"📝 Using custom follow-up {stage + 1} for {phone_number}")
             _send_twilio_reply(phone_number, custom_text)
             await store_message(phone_number, "agent", custom_text, "followup")
             await _mark_agent_replied(phone_number)
+
         else:
-            # No custom text — send AI generated through Dograh
+            # < 24h, AI generated through Dograh
             dograh_response = await _send_to_dograh(
                 api_key=api_key,
                 trigger_path=trigger_path,
@@ -1125,12 +1301,23 @@ async def takeover_conversation(request: Request):
 
 @app.post("/release")
 async def release_conversation(request: Request):
-    """Release conversation back to AI."""
+    """Release conversation back to AI.
+    
+    After human releases, sends a resume context message to Dograh so the AI
+    knows where to pick up the conversation — not from the beginning.
+    """
     data = await request.json()
     phone_number = data.get("phone_number")
 
     if not phone_number:
         raise HTTPException(status_code=400, detail="phone_number is required")
+
+    # Fetch stored takeover context before clearing
+    takeover_context = ""
+    if sessions_collection is not None:
+        session = await sessions_collection.find_one({"phone_number": phone_number})
+        if session:
+            takeover_context = session.get("takeover_context", "")
 
     await set_human_takeover(phone_number, False)
     logger.info(f"🤖 AI mode restored for {phone_number}")
@@ -1138,6 +1325,56 @@ async def release_conversation(request: Request):
     await store_message(
         phone_number, "agent", "Conversation returned to AI.", "system"
     )
+
+    # Send resume context to Dograh so AI picks up from the right step
+    if takeover_context:
+        try:
+            # Get agent config for this phone
+            # Find agent_number from session
+            agent_number = ""
+            if sessions_collection is not None:
+                session = await sessions_collection.find_one({"phone_number": phone_number})
+                if session:
+                    agent_number = session.get("agent_number", "").replace("whatsapp:", "")
+
+            if agent_number:
+                agent_doc = await _get_agent_doc(f"whatsapp:{agent_number}")
+                api_key = agent_doc.get("api_key", "")
+                trigger_path = agent_doc.get("trigger_path", "")
+
+                if api_key and trigger_path:
+                    resume_prompt = (
+                        f"[SYSTEM: A human agent just handled part of this conversation. "
+                        f"Context: {takeover_context} "
+                        f"The human has now handed back control to you. "
+                        f"Do NOT restart from the beginning. "
+                        f"Resume naturally from where the conversation was. "
+                        f"Send the appropriate next message to continue the flow.]"
+                    )
+                    resume_response = await _send_to_dograh(
+                        api_key=api_key,
+                        trigger_path=trigger_path,
+                        session_key=phone_number,
+                        text=resume_prompt,
+                    )
+                    resume_text = resume_response.get("assistant_text", "")
+                    # Strip [SEND_EXACT]: prefix if present
+                    if resume_text and resume_text.startswith("[SEND_EXACT]:"):
+                        resume_text = resume_text[len("[SEND_EXACT]:"):].strip()
+                    if resume_text and "TRANSFER_TO_HUMAN" not in resume_text:
+                        _send_twilio_reply(phone_number, resume_text)
+                        await store_message(phone_number, "agent", resume_text, "ai")
+                        await _mark_agent_replied(phone_number)
+                        logger.info(f"🔄 AI resumed for {phone_number}: {resume_text[:60]}")
+
+            # Clear takeover context after using it
+            if sessions_collection is not None:
+                await sessions_collection.update_one(
+                    {"phone_number": phone_number},
+                    {"$unset": {"takeover_context": ""}}
+                )
+        except Exception as e:
+            logger.warning(f"Failed to send resume context to Dograh: {e}")
 
     return {"success": True, "message": "Released to AI"}
 
@@ -1341,6 +1578,18 @@ async def update_agent(phone_number: str, request: Request):
     update = {k: v for k, v in data.items() if k in allowed_fields}
     if not update:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    # Sanitize strings — remove surrogate characters that break MongoDB UTF-8 encoding
+    def _sanitize(obj):
+        if isinstance(obj, str):
+            return obj.encode("utf-8", errors="replace").decode("utf-8")
+        if isinstance(obj, list):
+            return [_sanitize(i) for i in obj]
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        return obj
+
+    update = _sanitize(update)
 
     update["updated_at"] = datetime.now(timezone.utc)
     result = await agents_collection.update_one(

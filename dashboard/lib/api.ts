@@ -34,7 +34,7 @@ export interface Agent {
   trigger_path: string;
   followups_enabled: boolean;
   followup_delays: number[];
-  followup_messages: string[];
+  followup_messages: { message: string; template_sid: string }[];
   greeting_message: string;
   greeting_image_url: string;
   greeting_window_hours: number;

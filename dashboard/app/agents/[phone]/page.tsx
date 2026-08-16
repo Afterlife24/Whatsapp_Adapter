@@ -13,7 +13,11 @@ const DEFAULT_AGENT: Partial<Agent> = {
   trigger_path: "",
   followups_enabled: false,
   followup_delays: [300, 900, 1800],
-  followup_messages: ["", "", ""],
+  followup_messages: [
+    { message: "", template_sid: "" },
+    { message: "", template_sid: "" },
+    { message: "", template_sid: "" },
+  ],
   greeting_message: "",
   greeting_image_url: "",
   greeting_window_hours: 12,
@@ -223,44 +227,98 @@ export default function AgentDetailPage() {
         <div>
           <label className={labelCls}>Follow-up Delays &amp; Messages</label>
           <p className="text-xs text-[#44445a] mb-3">
-            Leave message empty → AI generated through Afterlife (contextual).<br/>
-            Set message → sent directly as custom text (Afterlife still called to keep session in sync).
+            Delays <span className="text-red-400 font-medium">≥ 24h require</span> a Twilio Template SID (free-form text blocked by WhatsApp).
+            Delays &lt; 24h: template optional, custom text or AI generated.
           </p>
 
           {/* Per-delay rows */}
           <div className="space-y-3 mb-4">
             {(form.followup_delays || []).map((d, idx) => {
-              const messages = form.followup_messages || [];
-              const msg = messages[idx] || "";
+              const messages = (form.followup_messages || []) as { message: string; template_sid: string }[];
+              const item: { message: string; template_sid: string } =
+                (typeof messages[idx] === "object" && messages[idx] !== null)
+                  ? messages[idx] as { message: string; template_sid: string }
+                  : { message: typeof messages[idx] === "string" ? (messages[idx] as string) : "", template_sid: "" };
+              const isOver24h = d >= 86400;
+
               return (
                 <div key={d} className="bg-[#0a0a0f] border border-[#2a2a3a] rounded-lg p-3 space-y-2">
+                  {/* Header */}
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-medium text-indigo-400">
-                      Follow-up {idx + 1} — after {formatDelay(d)}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-indigo-400">
+                        Follow-up {idx + 1} — after {formatDelay(d)}
+                      </span>
+                      {isOver24h && (
+                        <span className="text-[10px] bg-red-500/15 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded-full">
+                          ≥24h · Template required
+                        </span>
+                      )}
+                    </div>
                     <button onClick={() => {
                       removeDelay(d);
-                      const msgs = [...(form.followup_messages || [])];
+                      const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
                       msgs.splice(idx, 1);
                       set("followup_messages", msgs);
                     }} className="text-[#44445a] hover:text-red-400 transition-colors">
                       <X size={13} />
                     </button>
                   </div>
-                  <textarea
-                    value={msg}
-                    onChange={(e) => {
-                      const msgs = [...(form.followup_messages || [])];
-                      while (msgs.length <= idx) msgs.push("");
-                      msgs[idx] = e.target.value;
-                      set("followup_messages", msgs);
-                    }}
-                    placeholder="Leave empty for AI generated follow-up..."
-                    rows={2}
-                    className={`${inputCls} resize-none text-xs`}
-                  />
+
+                  {/* Template SID */}
+                  <div>
+                    <label className="block text-[10px] text-[#8888aa] mb-1">
+                      Twilio Template SID
+                      {isOver24h
+                        ? <span className="text-red-400 ml-1">* required for ≥24h</span>
+                        : <span className="text-[#44445a] ml-1">(optional)</span>}
+                    </label>
+                    <input
+                      value={item.template_sid}
+                      onChange={(e) => {
+                        const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
+                        while (msgs.length <= idx) msgs.push({ message: "", template_sid: "" });
+                        msgs[idx] = { ...msgs[idx], template_sid: e.target.value };
+                        set("followup_messages", msgs);
+                      }}
+                      placeholder="HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      className={`${inputCls} font-mono text-xs ${isOver24h && !item.template_sid ? "border-red-500/50" : ""}`}
+                    />
+                  </div>
+
+                  {/* Custom message — only for <24h */}
+                  {!isOver24h && (
+                    <div>
+                      <label className="block text-[10px] text-[#8888aa] mb-1">
+                        Custom message
+                        <span className="text-[#44445a] ml-1">(optional — leave empty for AI generated)</span>
+                      </label>
+                      <textarea
+                        value={item.message}
+                        onChange={(e) => {
+                          const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
+                          while (msgs.length <= idx) msgs.push({ message: "", template_sid: "" });
+                          msgs[idx] = { ...msgs[idx], message: e.target.value };
+                          set("followup_messages", msgs);
+                        }}
+                        placeholder="Leave empty for AI generated follow-up..."
+                        rows={2}
+                        className={`${inputCls} resize-none text-xs`}
+                      />
+                    </div>
+                  )}
+
+                  {/* Status hint */}
                   <p className="text-[10px] text-[#44445a]">
-                    {msg.trim() ? "📝 Custom text — will override AI reply" : "🤖 AI generated — Afterlife will create contextual message"}
+                    {isOver24h
+                      ? item.template_sid
+                        ? "📋 Will send Twilio template (bypasses 24h window) ✅"
+                        : "⚠️ No template — this follow-up will be skipped"
+                      : item.template_sid
+                      ? "📋 Will send Twilio template (optional for <24h)"
+                      : item.message?.trim()
+                      ? "📝 Will send custom text directly"
+                      : "🤖 AI generated through Afterlife"}
                   </p>
                 </div>
               );
@@ -272,8 +330,8 @@ export default function AgentDetailPage() {
             {DELAY_PRESETS.map((p) => (
               <button key={p.value} onClick={() => {
                 addDelay(p.value);
-                const msgs = [...(form.followup_messages || [])];
-                msgs.push("");
+                const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
+                msgs.push({ message: "", template_sid: "" });
                 set("followup_messages", msgs);
               }}
                 className="text-xs border border-[#2a2a3a] px-2.5 py-1 rounded-lg hover:bg-[#1a1a26] text-[#8888aa] hover:text-white transition-colors">
@@ -289,15 +347,15 @@ export default function AgentDetailPage() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   addCustomDelay();
-                  const msgs = [...(form.followup_messages || [])];
-                  msgs.push("");
+                  const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
+                  msgs.push({ message: "", template_sid: "" });
                   set("followup_messages", msgs);
                 }
               }} />
             <button onClick={() => {
               addCustomDelay();
-              const msgs = [...(form.followup_messages || [])];
-              msgs.push("");
+              const msgs = [...((form.followup_messages || []) as { message: string; template_sid: string }[])];
+              msgs.push({ message: "", template_sid: "" });
               set("followup_messages", msgs);
             }}
               className="flex items-center gap-1 text-xs border border-[#2a2a3a] text-[#8888aa] px-3 py-1.5 rounded-lg hover:bg-[#1a1a26] hover:text-white transition-colors">
