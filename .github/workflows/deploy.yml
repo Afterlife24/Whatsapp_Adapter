@@ -1,0 +1,31 @@
+name: Deploy WhatsApp Adapter to EC2
+
+# Whenever code lands on main, pull the latest on the EC2 self-hosted runner
+# and rebuild the whatsapp-adapter container inside the Dograh stack.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, "develop"]
+    steps:
+      - name: Pull latest adapter code and rebuild
+        run: |
+          set -euo pipefail
+
+          # Update the WhatsApp Adapter repo on EC2
+          cd /home/ubuntu/Whatsapp_Adapter
+          git fetch origin
+          git checkout main
+          git reset --hard origin/main
+
+          # Rebuild just the whatsapp-adapter container in the Dograh stack
+          cd /home/ubuntu/dograh
+          sudo docker compose --profile remote up -d --build whatsapp-adapter
+
+          # Restart nginx so it picks up any new container IPs
+          sudo docker compose --profile remote restart nginx
+
+          echo "WhatsApp Adapter redeployed: $(cd /home/ubuntu/Whatsapp_Adapter && git rev-parse --short HEAD)"
