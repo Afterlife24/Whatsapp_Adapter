@@ -549,7 +549,8 @@ async def whatsapp_webhook(
     except ValueError as e:
         logger.error(str(e))
         _send_twilio_reply(
-            sender, "Sorry, this service is not configured. Please try again later."
+            sender, "Sorry, this service is not configured. Please try again later.",
+            from_number=receiver
         )
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
@@ -559,7 +560,7 @@ async def whatsapp_webhook(
     allowed, quota_reason = await check_quota(agent_doc)
     if not allowed:
         logger.warning(f"🚫 Quota exceeded for {receiver}: {quota_reason}")
-        _send_twilio_reply(sender, "Sorry, this service is temporarily unavailable. Please try again later.")
+        _send_twilio_reply(sender, "Sorry, this service is temporarily unavailable. Please try again later.", from_number=receiver)
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
 
@@ -581,7 +582,7 @@ async def whatsapp_webhook(
                 )
                 await set_human_takeover(sender, True, takeover_context=takeover_ctx)
                 confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
-                _send_twilio_reply(sender, confirm_reply)
+                _send_twilio_reply(sender, confirm_reply, from_number=receiver)
                 await store_message(sender, "agent", confirm_reply, "system")
                 logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
                 resp = MessagingResponse()
@@ -593,7 +594,7 @@ async def whatsapp_webhook(
                     {"$set": {"pending_handoff": False}, "$unset": {"takeover_context": ""}}
                 )
                 no_reply = "No problem! Our standard fee is Rs.800 per session. Would you like to proceed with booking?"
-                _send_twilio_reply(sender, no_reply)
+                _send_twilio_reply(sender, no_reply, from_number=receiver)
                 await store_message(sender, "agent", no_reply, "ai")
                 await _mark_agent_replied(sender)
                 logger.info(f"❌ User declined handoff — AI continues for {sender}")
@@ -602,7 +603,7 @@ async def whatsapp_webhook(
 
             else:
                 retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
-                _send_twilio_reply(sender, retry_msg)
+                _send_twilio_reply(sender, retry_msg, from_number=receiver)
                 await store_message(sender, "agent", retry_msg, "system")
                 await _mark_agent_replied(sender)
                 resp = MessagingResponse()
@@ -621,7 +622,7 @@ async def whatsapp_webhook(
             mapping = await _get_agent_mapping(receiver)
             if mapping.get("greeting_message"):
                 image_url = mapping.get("greeting_image_url", "")
-                _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url)
+                _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url, from_number=receiver)
                 await store_message(sender, "agent", mapping["greeting_message"], "ai")
                 await _mark_agent_replied(sender)
                 logger.info(f"👋 Re-engagement greeting sent to {sender}")
@@ -678,7 +679,7 @@ async def whatsapp_webhook(
 
         if should_greet and not assistant_text.startswith("Greetings"):
             image_url = mapping.get("greeting_image_url", "")
-            _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url)
+            _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url, from_number=receiver)
             await store_message(sender, "agent", mapping["greeting_message"], "ai")
             await _mark_agent_replied(sender)
             greeting_sent = True
@@ -717,7 +718,7 @@ async def whatsapp_webhook(
             "I'd like to connect you with our team executive who can assist you better. "
             "Would you like me to transfer you to an executive? (Yes/No)"
         )
-        _send_twilio_reply(sender, confirm_msg)
+        _send_twilio_reply(sender, confirm_msg, from_number=receiver)
         await store_message(sender, "agent", confirm_msg, "system")
         await _mark_agent_replied(sender)
         logger.info(f"🔀 Pending handoff — confirmation requested for {sender}")
@@ -746,7 +747,7 @@ async def whatsapp_webhook(
                 )
                 await set_human_takeover(sender, True, takeover_context=takeover_context)
                 confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
-                _send_twilio_reply(sender, confirm_reply)
+                _send_twilio_reply(sender, confirm_reply, from_number=receiver)
                 await store_message(sender, "agent", confirm_reply, "system")
                 logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
                 resp = MessagingResponse()
@@ -764,7 +765,7 @@ async def whatsapp_webhook(
             else:
                 # Unclear response — ask again
                 retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
-                _send_twilio_reply(sender, retry_msg)
+                _send_twilio_reply(sender, retry_msg, from_number=receiver)
                 await store_message(sender, "agent", retry_msg, "system")
                 await _mark_agent_replied(sender)
                 resp = MessagingResponse()
@@ -783,7 +784,7 @@ async def whatsapp_webhook(
             logger.info(f"📍 Overriding Dograh reply with completion message for {sender}")
 
     if assistant_text:
-        _send_twilio_reply(sender, assistant_text)
+        _send_twilio_reply(sender, assistant_text, from_number=receiver)
         await store_message(sender, "agent", assistant_text, "ai")
         await _mark_agent_replied(sender)
         # Consume quota after successful reply
@@ -808,7 +809,7 @@ async def whatsapp_webhook(
             logger.info(f"✅ Lead {sender} marked COMPLETED (silent completion)")
         else:
             fallback = "I'm sorry, I couldn't process your message. Please try again."
-            _send_twilio_reply(sender, fallback)
+            _send_twilio_reply(sender, fallback, from_number=receiver)
             await store_message(sender, "agent", fallback, "ai")
 
     resp = MessagingResponse()
@@ -845,18 +846,26 @@ def _split_message(body: str, max_len: int = 1500) -> list[str]:
     return chunks
 
 
-def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str = "") -> None:
+def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str = "", from_number: str = "") -> None:
     """Send a WhatsApp message via Twilio API.
 
     If content_sid is provided, sends as a WhatsApp Template (bypasses 24h window).
     If media_url is provided, sends image + body as a single message (caption).
     Otherwise splits long text into chunks.
+    
+    from_number: the agent WhatsApp number to send from (e.g. whatsapp:+17178976546).
+                 Defaults to TWILIO_WHATSAPP_NUMBER env var if not provided.
     """
     if not twilio_client:
         logger.error("Twilio client not configured — cannot send reply")
         return
 
-    from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+    # Use the provided from_number (agent's number that received the message)
+    # Fall back to env var only if not provided
+    if not from_number:
+        from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+    elif not from_number.startswith("whatsapp:"):
+        from_number = f"whatsapp:{from_number}"
 
     # Template message — bypasses 24h window restriction
     if content_sid:
@@ -1150,21 +1159,21 @@ async def _process_followups() -> None:
                 continue
             # Send via Twilio template
             logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (delay={delays[stage]}s ≥24h)")
-            _send_twilio_reply(phone_number, "", content_sid=template_sid)
+            _send_twilio_reply(phone_number, "", content_sid=template_sid, from_number=agent_number)
             await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
             await _mark_agent_replied(phone_number)
 
         elif template_sid:
             # < 24h, template optionally set — use it
             logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (optional, <24h)")
-            _send_twilio_reply(phone_number, "", content_sid=template_sid)
+            _send_twilio_reply(phone_number, "", content_sid=template_sid, from_number=agent_number)
             await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
             await _mark_agent_replied(phone_number)
 
         elif custom_text:
             # < 24h, custom text — send directly, skip Dograh
             logger.info(f"📝 Using custom follow-up {stage + 1} for {phone_number}")
-            _send_twilio_reply(phone_number, custom_text)
+            _send_twilio_reply(phone_number, custom_text, from_number=agent_number)
             await store_message(phone_number, "agent", custom_text, "followup")
             await _mark_agent_replied(phone_number)
 
@@ -1178,7 +1187,7 @@ async def _process_followups() -> None:
             )
             followup_text = dograh_response["assistant_text"]
             if followup_text:
-                _send_twilio_reply(phone_number, followup_text)
+                _send_twilio_reply(phone_number, followup_text, from_number=agent_number)
                 await store_message(phone_number, "agent", followup_text, "followup")
                 await _mark_agent_replied(phone_number)
             else:
@@ -1362,7 +1371,7 @@ async def release_conversation(request: Request):
                     if resume_text and resume_text.startswith("[SEND_EXACT]:"):
                         resume_text = resume_text[len("[SEND_EXACT]:"):].strip()
                     if resume_text and "TRANSFER_TO_HUMAN" not in resume_text:
-                        _send_twilio_reply(phone_number, resume_text)
+                        _send_twilio_reply(phone_number, resume_text, from_number=agent_number)
                         await store_message(phone_number, "agent", resume_text, "ai")
                         await _mark_agent_replied(phone_number)
                         logger.info(f"🔄 AI resumed for {phone_number}: {resume_text[:60]}")
