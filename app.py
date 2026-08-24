@@ -617,7 +617,7 @@ async def whatsapp_webhook(
             # Reset lead status and followup stage
             await _set_lead_status(sender, "active")
             await _reset_followup(sender)
-            # Send greeting + image (same as new user)
+            # Send greeting + image if configured
             mapping = await _get_agent_mapping(receiver)
             if mapping.get("greeting_message"):
                 image_url = mapping.get("greeting_image_url", "")
@@ -625,8 +625,9 @@ async def whatsapp_webhook(
                 await store_message(sender, "agent", mapping["greeting_message"], "ai")
                 await _mark_agent_replied(sender)
                 logger.info(f"👋 Re-engagement greeting sent to {sender}")
-            resp = MessagingResponse()
-            return Response(content=str(resp), media_type="application/xml")
+                resp = MessagingResponse()
+                return Response(content=str(resp), media_type="application/xml")
+            # No greeting configured — fall through and let Dograh handle the message
 
     # Maps link interception — if user sends maps URL, handle completion directly
     # Dograh's LLM sometimes fails to match edge conditions on maps URLs
