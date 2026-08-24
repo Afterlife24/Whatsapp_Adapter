@@ -44,10 +44,9 @@ DOGRAH_API_BASE = os.getenv("DOGRAH_API_BASE", "http://localhost:8000/api/v1")
 DOGRAH_API_KEY = os.getenv("DOGRAH_API_KEY", "")
 DOGRAH_TRIGGER_PATH = os.getenv("DOGRAH_TRIGGER_PATH", "")
 
-# Twilio config
+# Twilio account-level credentials (same for all numbers; per-number routing comes from MongoDB)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "")
 
 # MongoDB config
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
@@ -854,7 +853,7 @@ def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str
     Otherwise splits long text into chunks.
     
     from_number: the agent WhatsApp number to send from (e.g. whatsapp:+17178976546).
-                 Defaults to TWILIO_WHATSAPP_NUMBER env var if not provided.
+                 If not provided, looked up from the agent config in MongoDB.
     """
     if not twilio_client:
         logger.error("Twilio client not configured — cannot send reply")
@@ -1454,7 +1453,21 @@ async def send_message(request: Request):
         raise HTTPException(
             status_code=500, detail="Twilio client not configured")
 
-    from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+    # Look up which agent number owns this conversation from MongoDB
+    agent_number = None
+    if mongo_db is not None:
+        conv = await mongo_db["conversations"].find_one(
+            {"phone_number": phone_number},
+            {"agent_number": 1}
+        )
+        if conv:
+            agent_number = conv.get("agent_number")
+    if not agent_number:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No agent number found for conversation with {phone_number}. Cannot determine which Twilio number to send from."
+        )
+    from_number = f"whatsapp:{agent_number}"
     try:
         twilio_message = twilio_client.messages.create(
             from_=from_number,
