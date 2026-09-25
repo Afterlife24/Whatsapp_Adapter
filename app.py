@@ -1052,6 +1052,9 @@ async def _process_followups() -> None:
         no_status_query = {
             "lead_status": {"$exists": False},
             "human_takeover": {"$ne": True},
+            "agent_number": {"$regex": "|".join(
+                a.replace("+", "\\+") for a in followup_agents
+            )},
         }
         no_status_sessions = await sessions_collection.find(no_status_query).to_list(length=500)
         seen = {s["phone_number"] for s in sessions}
