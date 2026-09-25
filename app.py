@@ -527,8 +527,17 @@ async def whatsapp_webhook(
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
 
-    # Ensure session exists
+    # Ensure session exists and agent_number is always current receiver
     await get_or_create_session(sender, agent_number=receiver)
+    # Always sync agent_number to the number that received this message
+    # This handles cases where a user switches from one agent number to another
+    if sessions_collection is not None:
+        await sessions_collection.update_one(
+            {"phone_number": sender},
+            {"$set": {"agent_number": receiver}}
+        )
+    elif sender in SESSIONS_STORE:
+        SESSIONS_STORE[sender]["agent_number"] = receiver
 
     # User replied — reset follow-up timer and stage
     await _reset_followup(sender)
@@ -614,9 +623,18 @@ async def whatsapp_webhook(
         if existing_session and existing_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
             old_status = existing_session.get("lead_status")
             logger.info(f"🔄 Re-engaging {sender} (was {old_status}) — resetting session")
-            # Reset lead status and followup stage
+            # Reset lead status, followup stage AND update agent_number to current receiver
             await _set_lead_status(sender, "active")
             await _reset_followup(sender)
+            # Always update agent_number to the number that received this message
+            if sessions_collection is not None:
+                await sessions_collection.update_one(
+                    {"phone_number": sender},
+                    {"$set": {"agent_number": receiver}}
+                )
+            elif sender in SESSIONS_STORE:
+                SESSIONS_STORE[sender]["agent_number"] = receiver
+            logger.info(f"🔄 Updated agent_number to {receiver} for {sender}")
             # Send greeting + image if configured
             mapping = await _get_agent_mapping(receiver)
             if mapping.get("greeting_message"):
