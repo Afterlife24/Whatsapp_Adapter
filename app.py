@@ -23,12 +23,18 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Request, Response
+from fastapi import FastAPI, Form, HTTPException, Request, Response, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
 from loguru import logger
+from bson import ObjectId
+from bson.errors import InvalidId
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 
 load_dotenv()
 
@@ -39,6 +45,12 @@ load_dotenv()
 
 # Dograh backend base URL (the /api/v1 prefix)
 DOGRAH_API_BASE = os.getenv("DOGRAH_API_BASE", "http://localhost:8000/api/v1")
+
+# AgentX (AgentPlatform) internal credits API — used by the operator billing
+# console (Phase 6). The internal secret authenticates service-to-service calls
+# and MUST never be exposed to the dashboard/browser (R7.10).
+AGENTX_INTERNAL_BASE = os.getenv("AGENTX_INTERNAL_BASE", "http://api:8000/api/v1")
+DOGRAH_INTERNAL_SECRET = os.getenv("DOGRAH_INTERNAL_SECRET", "")
 
 # Default agent config (single-agent setup)
 DOGRAH_API_KEY = os.getenv("DOGRAH_API_KEY", "")
@@ -52,10 +64,27 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "whatsapp_adapter")
 
+# Adapter authentication (Phase 1)
+ADAPTER_ADMIN_PASSWORD = os.getenv("ADAPTER_ADMIN_PASSWORD")
+ADAPTER_SESSION_SECRET = os.getenv("ADAPTER_SESSION_SECRET")
+
+# Fail-fast validation
+if not ADAPTER_ADMIN_PASSWORD:
+    raise RuntimeError("ADAPTER_ADMIN_PASSWORD must be set in .env")
+if not ADAPTER_SESSION_SECRET:
+    raise RuntimeError("ADAPTER_SESSION_SECRET must be set in .env")
+
+# Session config
+SESSION_COOKIE = "adapter_session"
+SESSION_MAX_AGE = 12 * 60 * 60  # 12 hours
+signer = TimestampSigner(ADAPTER_SESSION_SECRET)
+
 # Initialize Twilio client
 twilio_client: TwilioClient | None = None
+twilio_validator: RequestValidator | None = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
     logger.info("Twilio client initialized")
 
 # For multi-agent setups, define a JSON mapping in the env:
@@ -156,6 +185,8 @@ db = None
 sessions_collection = None
 chats_collection = None
 agents_collection = None
+billing_accounts_collection = None  # Phase 6: operator billing accounts
+payments_collection = None  # Phase 6: recorded payments (two-phase grant)
 
 # In-memory fallback (if MongoDB is unavailable)
 SESSIONS_STORE: dict = {}  # phone_number -> session dict
@@ -171,20 +202,76 @@ CONVERSATIONS_CACHE: dict = {"data": None, "expires_at": 0}
 
 app = FastAPI(title="WhatsApp-Dograh Adapter")
 
-# CORS — allow dashboard to connect
+# CORS — allow the dashboard to connect (locked down to a specific origin).
+# Prefer ADAPTER_CORS_ORIGIN (the Phase 8 config name); fall back to the
+# Phase 1 name DASHBOARD_ORIGIN so existing deployments keep working.
+DASHBOARD_ORIGIN = (
+    os.getenv("ADAPTER_CORS_ORIGIN")
+    or os.getenv("DASHBOARD_ORIGIN")
+    or "http://localhost:3001"
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[DASHBOARD_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------------------------------------------------------------------------
+# Authentication (Phase 1)
+# ---------------------------------------------------------------------------
+
+async def require_operator(adapter_session: Optional[str] = Cookie(None)):
+    """Dependency: require valid session cookie."""
+    if not adapter_session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        signer.unsign(adapter_session, max_age=SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return True
+
+
+@app.post("/adapter/auth/login")
+async def login(request: Request):
+    """Login endpoint for dashboard operators."""
+    data = await request.json()
+    password = data.get("password", "")
+    if password != ADAPTER_ADMIN_PASSWORD:
+        logger.warning(f"Failed login attempt from {request.client.host}")
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Create signed session cookie
+    token = signer.sign(b"operator").decode()
+    response = JSONResponse({"success": True, "message": "Logged in"})
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=False,  # Set to True in production with HTTPS
+        samesite="lax",
+    )
+    logger.info(f"✅ Operator logged in from {request.client.host}")
+    return response
+
+
+@app.post("/adapter/auth/logout")
+async def logout():
+    """Logout endpoint — clears session cookie."""
+    response = JSONResponse({"success": True, "message": "Logged out"})
+    response.delete_cookie(key=SESSION_COOKIE)
+    logger.info("Operator logged out")
+    return response
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize MongoDB connection and indexes."""
     global mongo_client, db, sessions_collection, chats_collection, agents_collection
+    global billing_accounts_collection, payments_collection
 
     try:
         mongo_client = AsyncIOMotorClient(
@@ -195,11 +282,31 @@ async def startup():
         sessions_collection = db["sessions"]
         chats_collection = db["chats"]
         agents_collection = db["agents"]
+        billing_accounts_collection = db["billing_accounts"]
+        payments_collection = db["payments"]
 
         # Create indexes
         await sessions_collection.create_index("phone_number", unique=True)
         await chats_collection.create_index([("phone_number", 1), ("timestamp", 1)])
         await agents_collection.create_index("phone_number", unique=True)
+
+        # Phase 6: billing collections.
+        # One account per AgentX organization.
+        await billing_accounts_collection.create_index(
+            "organization_id", unique=True
+        )
+        # Payments listed newest-first per org, and filterable by status.
+        await payments_collection.create_index(
+            [("organization_id", 1), ("created_at", -1)]
+        )
+        await payments_collection.create_index("status")
+        # One payment per browser submission. The dashboard generates this id
+        # when the operator reviews a payment and reuses it on every resubmit,
+        # so a lost response + second click can't create a second payment.
+        # Sparse: older payments without the field are not indexed.
+        await payments_collection.create_index(
+            "client_request_id", unique=True, sparse=True
+        )
 
         logger.info(f"✅ Connected to MongoDB: {MONGODB_DATABASE}")
 
@@ -512,6 +619,25 @@ async def whatsapp_webhook(
     If human_takeover is active for this conversation, the message is stored
     but NOT forwarded to Dograh — a human will respond from the dashboard.
     """
+    # Validate Twilio signature (Task 1.4)
+    if twilio_validator:
+        # Reconstruct full URL using X-Forwarded-Proto and Host headers (for reverse proxies)
+        proto = request.headers.get("X-Forwarded-Proto", "https")
+        host = request.headers.get("Host", request.url.hostname or "")
+        full_url = f"{proto}://{host}{request.url.path}"
+        
+        # Get Twilio signature from headers
+        signature = request.headers.get("X-Twilio-Signature", "")
+        
+        # Build params dict from form data
+        form_data = await request.form()
+        params = {key: value for key, value in form_data.items()}
+        
+        # Validate signature
+        if not twilio_validator.validate(full_url, params, signature):
+            logger.warning(f"⚠️ Invalid Twilio signature from {request.client.host}")
+            raise HTTPException(status_code=403, detail="Invalid request signature")
+    
     user_message = Body.strip()
     sender = From  # e.g. "whatsapp:+919876543210"
     receiver = To  # e.g. "whatsapp:+14155551234"
@@ -984,6 +1110,45 @@ async def _send_to_dograh(
         return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
 
 
+async def _agentx_internal(
+    method: str, path: str, payload: dict | None = None
+) -> dict:
+    """Call AgentX's internal credits API, authenticating with the shared secret.
+
+    The browser never holds DOGRAH_INTERNAL_SECRET (R7.10): the dashboard talks
+    to this adapter, and only the adapter forwards the secret to AgentX over the
+    internal Docker network (http://api:8000 by default).
+
+    Args:
+        method: HTTP verb ("GET", "POST")
+        path: path under /internal/credits (e.g. "/resolve-account")
+        payload: JSON body for POST requests
+
+    Returns:
+        The parsed JSON response.
+
+    Raises:
+        HTTPException: with AgentX's status code if it returns >= 400. The secret
+            is never included in the raised detail.
+    """
+    url = f"{AGENTX_INTERNAL_BASE}/internal/credits{path}"
+    headers = {
+        "X-Dograh-Internal-Secret": DOGRAH_INTERNAL_SECRET,
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.request(method, url, json=payload, headers=headers)
+
+    if response.status_code >= 400:
+        # Surface AgentX's status but truncate the body and never echo the secret.
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"AgentX credits API error: {response.text[:300]}",
+        )
+
+    return response.json()
+
+
 async def check_quota(agent_doc: dict) -> tuple[bool, str]:
     """Check if agent has quota remaining. Returns (allowed, reason)."""
     if not agent_doc.get("quota_enabled", False):
@@ -1230,7 +1395,7 @@ async def _process_followups() -> None:
 
 
 @app.get("/conversations")
-async def get_conversations(agent_number: str = ""):
+async def get_conversations(agent_number: str = "", _auth: bool = Depends(require_operator)):
     """Get all conversations for the dashboard (cached 30s). Optionally filter by agent_number."""
     now = time.monotonic()
     cache_key = agent_number or "all"
@@ -1288,7 +1453,7 @@ async def get_conversations(agent_number: str = ""):
 
 
 @app.get("/messages/{phone_number:path}")
-async def get_messages(phone_number: str):
+async def get_messages(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get all messages for a specific conversation."""
     phone_number = phone_number.replace("%3A", ":")
 
@@ -1311,7 +1476,7 @@ async def get_messages(phone_number: str):
 
 
 @app.post("/takeover")
-async def takeover_conversation(request: Request):
+async def takeover_conversation(request: Request, _auth: bool = Depends(require_operator)):
     """Human agent takes over a conversation (AI stops responding)."""
     data = await request.json()
     phone_number = data.get("phone_number")
@@ -1330,7 +1495,7 @@ async def takeover_conversation(request: Request):
 
 
 @app.post("/release")
-async def release_conversation(request: Request):
+async def release_conversation(request: Request, _auth: bool = Depends(require_operator)):
     """Release conversation back to AI.
     
     After human releases, sends a resume context message to Dograh so the AI
@@ -1453,7 +1618,7 @@ async def receive_lead_data(request: Request):
 
 
 @app.post("/send-message")
-async def send_message(request: Request):
+async def send_message(request: Request, _auth: bool = Depends(require_operator)):
     """Human agent sends a message via the dashboard."""
     data = await request.json()
     phone_number = data.get("phone_number")
@@ -1477,13 +1642,13 @@ async def send_message(request: Request):
 
     # Look up which agent number owns this conversation from MongoDB
     agent_number = None
-    if mongo_db is not None:
-        conv = await mongo_db["conversations"].find_one(
+    if sessions_collection is not None:
+        session = await sessions_collection.find_one(
             {"phone_number": phone_number},
             {"agent_number": 1}
         )
-        if conv:
-            agent_number = conv.get("agent_number")
+        if session:
+            agent_number = session.get("agent_number")
     if not agent_number:
         raise HTTPException(
             status_code=500,
@@ -1528,18 +1693,28 @@ def _make_agent_prefix(agent_name: str) -> str:
 
 
 def _serialize_agent(doc: dict) -> dict:
-    """Serialize an agent document for JSON response (remove MongoDB _id)."""
+    """Serialize an agent document for JSON response (remove MongoDB _id, mask API key)."""
     doc = dict(doc)
     doc.pop("_id", None)
     if doc.get("created_at"):
         doc["created_at"] = doc["created_at"].isoformat() + "Z"
     if doc.get("updated_at"):
         doc["updated_at"] = doc["updated_at"].isoformat() + "Z"
+    
+    # Mask API key (Task 1.5): show first 8 + last 4 chars
+    if doc.get("api_key"):
+        key = doc["api_key"]
+        if len(key) > 12:
+            doc["api_key"] = f"{key[:8]}...{key[-4:]}"
+        else:
+            # Too short to mask — hide completely
+            doc["api_key"] = "***"
+    
     return doc
 
 
 @app.get("/agents")
-async def list_agents():
+async def list_agents(_auth: bool = Depends(require_operator)):
     """List all agents."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1548,7 +1723,7 @@ async def list_agents():
 
 
 @app.post("/agents")
-async def create_agent(request: Request):
+async def create_agent(request: Request, _auth: bool = Depends(require_operator)):
     """Create a new agent."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1593,7 +1768,7 @@ async def create_agent(request: Request):
 
 
 @app.get("/agents/{phone_number:path}")
-async def get_agent(phone_number: str):
+async def get_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get a single agent by phone number."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1605,7 +1780,7 @@ async def get_agent(phone_number: str):
 
 
 @app.put("/agents/{phone_number:path}")
-async def update_agent(phone_number: str, request: Request):
+async def update_agent(phone_number: str, request: Request, _auth: bool = Depends(require_operator)):
     """Update an agent's config."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1649,7 +1824,7 @@ async def update_agent(phone_number: str, request: Request):
 
 
 @app.delete("/agents/{phone_number:path}")
-async def delete_agent(phone_number: str):
+async def delete_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Delete an agent."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1662,7 +1837,7 @@ async def delete_agent(phone_number: str):
 
 
 @app.post("/agents/{phone_number:path}/reset-quota")
-async def reset_agent_quota(phone_number: str):
+async def reset_agent_quota(phone_number: str, _auth: bool = Depends(require_operator)):
     """Reset quota_used to 0 for an agent (e.g. after payment/renewal)."""
     if agents_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
@@ -1686,7 +1861,7 @@ async def reset_agent_quota(phone_number: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/leads")
-async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = ""):
+async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = "", _auth: bool = Depends(require_operator)):
     """Get all captured leads, newest first. Optionally filter by agent_number."""
     if db is None:
         return []
@@ -1705,3 +1880,418 @@ async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = ""):
             lead["created_at"] = lead["created_at"].isoformat() + "Z"
         result.append(lead)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Operator billing console
+#
+# All routes are namespaced under /adapter/billing/ and gated by
+# require_operator. The browser never holds the AgentX secret: these handlers
+# forward to AgentX via _agentx_internal over the internal Docker network.
+# ---------------------------------------------------------------------------
+
+
+def _iso_utc(value: datetime) -> str:
+    """ISO-8601 in UTC that JavaScript's Date can parse.
+
+    Datetimes read back from MongoDB are naive UTC; ones built in-request are
+    timezone-aware. Appending "Z" to an aware value would produce an invalid
+    "...+00:00Z", so normalise both cases.
+    """
+    if value.tzinfo is None:
+        return value.isoformat() + "Z"
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _serialize_billing_account(doc: dict) -> dict:
+    """Serialize a billing_accounts document for a JSON response."""
+    doc = dict(doc)
+    doc.pop("_id", None)
+    for key in ("created_at", "updated_at"):
+        value = doc.get(key)
+        if isinstance(value, datetime):
+            doc[key] = _iso_utc(value)
+    return doc
+
+
+def _serialize_payment(doc: dict) -> dict:
+    """Serialize a payments document for a JSON response.
+
+    The MongoDB _id is exposed as a string `payment_id` because it is the
+    source of the idempotency key and the retry endpoint needs it.
+    """
+    doc = dict(doc)
+    _id = doc.pop("_id", None)
+    if _id is not None:
+        doc["payment_id"] = str(_id)
+    value = doc.get("created_at")
+    if isinstance(value, datetime):
+        doc["created_at"] = _iso_utc(value)
+    return doc
+
+
+_LIVE_BALANCE_FIELDS = (
+    "email",
+    "balance_usd",
+    "display_currency",
+    "display_fx_rate_to_usd",
+    "balance_display",
+    "is_blocked",
+    "low_balance_threshold_usd",
+)
+
+
+def _apply_live_balance(account: dict, resolved: dict) -> dict:
+    """Copy AgentX's live balance fields onto a serialized billing account.
+
+    Balances are always read live from AgentX, never cached locally (R7.8).
+    The stored email is kept if AgentX has none.
+    """
+    for field in _LIVE_BALANCE_FIELDS:
+        value = resolved.get(field)
+        if field == "email" and not value:
+            continue
+        account[field] = value
+    return account
+
+
+async def _resolve_org_from_agent(agent_phone: str) -> dict:
+    """Resolve an AgentX organization from an agent's stored API key.
+
+    The operator never types an organization id — it is derived from the
+    api_key already stored on the agent document, then confirmed via the
+    resolved email.
+    """
+    if agents_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    clean = agent_phone.replace("%2B", "+").replace("whatsapp:", "").strip()
+    agent = await agents_collection.find_one({"phone_number": clean})
+    if not agent:
+        raise HTTPException(
+            status_code=404, detail=f"No agent found for {clean}"
+        )
+
+    api_key = (agent.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent {clean} has no API key configured",
+        )
+
+    # Ask AgentX to resolve the org + balance from the raw key.
+    return await _agentx_internal(
+        "POST", "/resolve-account", {"api_key": api_key}
+    )
+
+
+@app.post("/adapter/billing/resolve")
+async def billing_resolve(
+    request: Request, _auth: bool = Depends(require_operator)
+):
+    """Preview the AgentX account for an agent's phone number WITHOUT saving.
+
+    Lets the operator confirm the resolved email + balance before creating a
+    billing account.
+    """
+    data = await request.json()
+    agent_phone = (data.get("agent_phone") or "").strip()
+    if not agent_phone:
+        raise HTTPException(status_code=400, detail="agent_phone is required")
+
+    resolved = await _resolve_org_from_agent(agent_phone)
+    return resolved
+
+
+@app.get("/adapter/billing/accounts")
+async def billing_list_accounts(_auth: bool = Depends(require_operator)):
+    """List saved billing accounts, each with a live balance from AgentX."""
+    if billing_accounts_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    accounts = []
+    cursor = billing_accounts_collection.find({}).sort("created_at", -1)
+    async for doc in cursor:
+        account = _serialize_billing_account(doc)
+        # Fetch a live balance; if AgentX is briefly unreachable for one org,
+        # don't fail the whole list — mark that row.
+        try:
+            live = await _agentx_internal(
+                "POST",
+                "/resolve-account",
+                {"organization_id": doc["organization_id"]},
+            )
+            _apply_live_balance(account, live)
+        except HTTPException as e:
+            account["balance_error"] = f"Could not fetch balance ({e.status_code})"
+        accounts.append(account)
+
+    return accounts
+
+
+@app.post("/adapter/billing/accounts")
+async def billing_create_account(
+    request: Request, _auth: bool = Depends(require_operator)
+):
+    """Create a billing account by resolving the org from an agent's API key."""
+    if billing_accounts_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    data = await request.json()
+    agent_phone = (data.get("agent_phone") or "").strip()
+    label = (data.get("label") or "").strip()
+    if not agent_phone:
+        raise HTTPException(status_code=400, detail="agent_phone is required")
+
+    resolved = await _resolve_org_from_agent(agent_phone)
+    organization_id = resolved["organization_id"]
+
+    existing = await billing_accounts_collection.find_one(
+        {"organization_id": organization_id}
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Billing account for org {organization_id} already exists",
+        )
+
+    clean_phone = agent_phone.replace("whatsapp:", "").strip()
+    now = datetime.now(timezone.utc)
+    doc = {
+        "organization_id": organization_id,
+        "email": resolved.get("email"),  # from AgentX, display only
+        "label": label or resolved.get("email") or f"Org {organization_id}",
+        "agent_numbers": [clean_phone],
+        "created_at": now,
+        "updated_at": now,
+    }
+    await billing_accounts_collection.insert_one(doc)
+    logger.info(
+        f"✅ Billing account created for org {organization_id} "
+        f"({resolved.get('email')})"
+    )
+
+    return _apply_live_balance(_serialize_billing_account(doc), resolved)
+
+
+@app.get("/adapter/billing/accounts/{organization_id}")
+async def billing_account_detail(
+    organization_id: int, _auth: bool = Depends(require_operator)
+):
+    """Return a saved account plus its live balance and AgentX ledger."""
+    if billing_accounts_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    doc = await billing_accounts_collection.find_one(
+        {"organization_id": organization_id}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Billing account not found")
+
+    account = _serialize_billing_account(doc)
+
+    # Live balance
+    resolved = await _agentx_internal(
+        "POST", "/resolve-account", {"organization_id": organization_id}
+    )
+    _apply_live_balance(account, resolved)
+
+    # Ledger from AgentX
+    ledger = await _agentx_internal(
+        "GET", f"/{organization_id}/ledger?page=1&limit=50"
+    )
+
+    # Local payment records (newest first) so failed/pending ones are visible
+    payments = []
+    if payments_collection is not None:
+        cursor = payments_collection.find(
+            {"organization_id": organization_id}
+        ).sort("created_at", -1)
+        async for pdoc in cursor:
+            payments.append(_serialize_payment(pdoc))
+
+    return {"account": account, "ledger": ledger, "payments": payments}
+
+
+async def _execute_grant(payment_doc: dict) -> dict:
+    """Call AgentX grant for a payment doc, deriving the key from its _id.
+
+    Updates the payment record to confirmed/failed and returns the updated
+    serialized payment. The idempotency key is grant:{_id} so a retry (which
+    reuses the same _id) can never double-credit.
+    """
+    payment_id = payment_doc["_id"]
+    idempotency_key = f"grant:{payment_id}"
+
+    grant_payload = {
+        "organization_id": payment_doc["organization_id"],
+        "idempotency_key": idempotency_key,
+        "paid_amount_minor": payment_doc["paid_amount_minor"],
+        "paid_currency": payment_doc["paid_currency"],
+        "note": payment_doc.get("note"),
+        "created_by": payment_doc.get("created_by"),
+    }
+    if payment_doc.get("fx_rate_to_usd") is not None:
+        grant_payload["fx_rate_to_usd"] = str(payment_doc["fx_rate_to_usd"])
+
+    try:
+        result = await _agentx_internal("POST", "/grant", grant_payload)
+    except HTTPException as e:
+        await payments_collection.update_one(
+            {"_id": payment_id},
+            {"$set": {"status": "failed", "error": str(e.detail)}},
+        )
+        logger.error(
+            f"Grant failed for payment {payment_id} "
+            f"(org {payment_doc['organization_id']}): {e.detail}"
+        )
+        updated = await payments_collection.find_one({"_id": payment_id})
+        return _serialize_payment(updated)
+
+    await payments_collection.update_one(
+        {"_id": payment_id},
+        {
+            "$set": {
+                "status": "confirmed",
+                "agentx_entry_id": result.get("entry_id"),
+                "credited_usd": result.get("credited_usd"),
+                "duplicate": result.get("duplicate", False),
+                "error": None,
+            }
+        },
+    )
+    logger.info(
+        f"✅ Grant confirmed for payment {payment_id}: "
+        f"${result.get('credited_usd')} (duplicate={result.get('duplicate')})"
+    )
+    updated = await payments_collection.find_one({"_id": payment_id})
+    return _serialize_payment(updated)
+
+
+@app.post("/adapter/billing/accounts/{organization_id}/payments")
+async def billing_record_payment(
+    organization_id: int, request: Request, _auth: bool = Depends(require_operator)
+):
+    """Two-phase payment: insert pending, then grant with key = grant:{_id}.
+
+    1. Insert the payment doc with status 'pending' — Mongo returns _id.
+    2. Call AgentX grant with idempotency_key grant:{_id}.
+    3. Success -> confirmed; failure -> failed (visible + retryable).
+    """
+    if payments_collection is None or billing_accounts_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    account = await billing_accounts_collection.find_one(
+        {"organization_id": organization_id}
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Billing account not found")
+
+    data = await request.json()
+
+    # Amount arrives as integer minor units (the frontend converts, not us).
+    paid_amount_minor = data.get("paid_amount_minor")
+    if not isinstance(paid_amount_minor, int) or paid_amount_minor <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="paid_amount_minor must be a positive integer (minor units)",
+        )
+
+    paid_currency = (data.get("paid_currency") or "").strip().upper()
+    if len(paid_currency) != 3:
+        raise HTTPException(
+            status_code=400, detail="paid_currency must be a 3-letter code"
+        )
+
+    fx_rate_to_usd = data.get("fx_rate_to_usd")  # optional, string/number
+    note = (data.get("note") or "").strip() or None
+    created_by = (data.get("created_by") or "").strip() or None
+
+    # Optional submission id from the dashboard. Reusing it returns the same
+    # payment, so a resubmit after a lost response can't create a second one.
+    client_request_id = data.get("client_request_id")
+    if client_request_id is not None:
+        if (
+            not isinstance(client_request_id, str)
+            or not 8 <= len(client_request_id) <= 64
+        ):
+            raise HTTPException(
+                status_code=400, detail="client_request_id must be 8-64 characters"
+            )
+
+    async def _replay(existing: dict) -> dict:
+        if existing["organization_id"] != organization_id:
+            raise HTTPException(
+                status_code=409,
+                detail="client_request_id already used for another account",
+            )
+        if existing.get("status") == "confirmed":
+            return _serialize_payment(existing)
+        # Same _id -> same grant:{_id} key, so this can't double-credit.
+        return await _execute_grant(existing)
+
+    if client_request_id:
+        existing = await payments_collection.find_one(
+            {"client_request_id": client_request_id}
+        )
+        if existing:
+            return await _replay(existing)
+
+    # Phase 1: insert the pending record. Its _id becomes the idempotency key.
+    now = datetime.now(timezone.utc)
+    payment_doc = {
+        "organization_id": organization_id,
+        "paid_amount_minor": paid_amount_minor,
+        "paid_currency": paid_currency,
+        "fx_rate_to_usd": fx_rate_to_usd,
+        "note": note,
+        "created_by": created_by,
+        "status": "pending",
+        "agentx_entry_id": None,
+        "credited_usd": None,
+        "error": None,
+        "created_at": now,
+    }
+    if client_request_id:
+        payment_doc["client_request_id"] = client_request_id
+
+    try:
+        insert_result = await payments_collection.insert_one(payment_doc)
+    except DuplicateKeyError:
+        # Two identical submissions raced; the other one won the insert.
+        existing = await payments_collection.find_one(
+            {"client_request_id": client_request_id}
+        )
+        return await _replay(existing)
+    payment_doc["_id"] = insert_result.inserted_id
+
+    # Phase 2: grant. Key derived from _id so retries never double-credit.
+    return await _execute_grant(payment_doc)
+
+
+@app.post("/adapter/billing/payments/{payment_id}/retry")
+async def billing_retry_payment(
+    payment_id: str, _auth: bool = Depends(require_operator)
+):
+    """Retry a failed grant, reusing the SAME idempotency key (grant:{_id}).
+
+    AgentX either applies the grant once or reports duplicate — there is no
+    sequence of retries that credits twice.
+    """
+    if payments_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+
+    try:
+        oid = ObjectId(payment_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid payment_id")
+
+    payment_doc = await payments_collection.find_one({"_id": oid})
+    if not payment_doc:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    if payment_doc.get("status") == "confirmed":
+        # Already done — return as-is rather than re-granting.
+        return _serialize_payment(payment_doc)
+
+    return await _execute_grant(payment_doc)

@@ -1,23 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getHealth, getAdapterUrl, setAdapterUrl } from "@/lib/api";
-import { CheckCircle, XCircle, RefreshCw, Save, Pencil } from "lucide-react";
+import { getHealth, logout } from "@/lib/api";
+import { CheckCircle, XCircle, RefreshCw, LogOut } from "lucide-react";
+import { useRouter } from "next/navigation";
 
 export default function SettingsPage() {
+  const router = useRouter();
   const [health, setHealth] = useState<{ status: string; mongo: boolean } | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
-  const [adapterUrl, setAdapterUrlState] = useState("");
-  const [editingUrl, setEditingUrl] = useState(false);
-  const [urlInput, setUrlInput] = useState("");
-  const [urlSaved, setUrlSaved] = useState(false);
-
-  useEffect(() => {
-    const url = getAdapterUrl();
-    setAdapterUrlState(url);
-    setUrlInput(url);
-    checkHealth();
-  }, []);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   const checkHealth = () => {
     setHealthLoading(true);
@@ -27,16 +19,15 @@ export default function SettingsPage() {
       .finally(() => setHealthLoading(false));
   };
 
-  const handleSaveUrl = () => {
-    const trimmed = urlInput.trim().replace(/\/$/, "");
-    if (!trimmed) return;
-    setAdapterUrl(trimmed);
-    setAdapterUrlState(trimmed);
-    setEditingUrl(false);
-    setUrlSaved(true);
-    setTimeout(() => setUrlSaved(false), 2000);
-    // Re-check health with new URL
-    setTimeout(() => checkHealth(), 300);
+  useEffect(() => { checkHealth(); }, []);
+
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    try {
+      await logout();
+    } finally {
+      router.push("/login");
+    }
   };
 
   const sectionCls = "bg-[#0d0d14] rounded-xl border border-[#1e1e2e] p-5 space-y-4";
@@ -48,65 +39,14 @@ export default function SettingsPage() {
         <p className="text-sm text-[#666880] mt-1">Adapter configuration and health</p>
       </div>
 
-      {/* Adapter URL — editable */}
-      <section className={sectionCls}>
-        <div className="flex items-center justify-between">
-          <h2 className="font-semibold text-white">Adapter URL</h2>
-          {urlSaved && (
-            <span className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-1 rounded-lg">
-              ✓ Saved
-            </span>
-          )}
-        </div>
-
-        {editingUrl ? (
-          <div className="space-y-3">
-            <input
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSaveUrl()}
-              placeholder="https://your-domain.com or http://localhost:8001"
-              className="w-full bg-[#0a0a0f] border border-indigo-500/50 rounded-lg px-3 py-2.5 text-sm text-white font-mono placeholder-[#44445a] focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
-              autoFocus
-            />
-            <div className="flex items-center gap-2">
-              <button onClick={handleSaveUrl}
-                className="flex items-center gap-1.5 text-sm bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-500 transition-colors">
-                <Save size={13} /> Save
-              </button>
-              <button onClick={() => { setEditingUrl(false); setUrlInput(adapterUrl); }}
-                className="text-sm text-[#44445a] hover:text-white transition-colors px-3 py-2">
-                Cancel
-              </button>
-            </div>
-            <p className="text-xs text-[#44445a]">
-              Saved in browser localStorage — no restart needed. Works for both local and production.
-            </p>
-          </div>
-        ) : (
-          <div className="flex items-center gap-3">
-            <div className="flex-1 bg-[#0a0a0f] border border-[#2a2a3a] rounded-lg px-4 py-2.5 font-mono text-sm text-indigo-400 truncate">
-              {adapterUrl}
-            </div>
-            <button onClick={() => setEditingUrl(true)}
-              className="flex items-center gap-1.5 text-sm text-[#8888aa] border border-[#2a2a3a] px-3 py-2 rounded-lg hover:bg-[#1a1a26] hover:text-white transition-colors flex-shrink-0">
-              <Pencil size={13} /> Edit
-            </button>
-          </div>
-        )}
-
-        <div className="text-xs text-[#44445a] space-y-1">
-          <p><span className="text-[#8888aa]">Local dev:</span> http://localhost:8001</p>
-          <p><span className="text-[#8888aa]">Production:</span> https://your-domain.com (set once, remembered)</p>
-        </div>
-      </section>
-
       {/* Health */}
       <section className={sectionCls}>
         <div className="flex items-center justify-between">
           <h2 className="font-semibold text-white">System Health</h2>
-          <button onClick={checkHealth}
-            className="flex items-center gap-1.5 text-xs text-[#8888aa] border border-[#2a2a3a] px-3 py-1.5 rounded-lg hover:bg-[#1a1a26] hover:text-white transition-colors">
+          <button
+            onClick={checkHealth}
+            className="flex items-center gap-1.5 text-xs text-[#8888aa] border border-[#2a2a3a] px-3 py-1.5 rounded-lg hover:bg-[#1a1a26] hover:text-white transition-colors"
+          >
             <RefreshCw size={13} /> Refresh
           </button>
         </div>
@@ -115,10 +55,7 @@ export default function SettingsPage() {
         ) : (
           <div className="space-y-0">
             <div className="flex items-center justify-between py-3 border-b border-[#1a1a26]">
-              <div>
-                <span className="text-sm text-[#c0c0d8]">Adapter API</span>
-                <p className="text-xs text-[#44445a] font-mono mt-0.5">{adapterUrl}/health</p>
-              </div>
+              <span className="text-sm text-[#c0c0d8]">Adapter API</span>
               {health?.status === "ok" ? (
                 <span className="flex items-center gap-1.5 text-emerald-400 text-sm font-medium">
                   <CheckCircle size={15} /> Online
@@ -145,24 +82,55 @@ export default function SettingsPage() {
         )}
       </section>
 
-      {/* Webhooks */}
+      {/* Webhook endpoints */}
       <section className={sectionCls}>
         <h2 className="font-semibold text-white">Webhook Endpoints</h2>
         <div className="space-y-0">
           {[
-            { label: "Twilio WhatsApp Webhook", path: "/whatsapp", method: "POST", hint: "Set this in Twilio console" },
-            { label: "Afterlife Lead Data Webhook", path: "/webhook/lead-data", method: "POST", hint: "Set this in Afterlife workflow webhook node" },
+            {
+              label: "Twilio WhatsApp Webhook",
+              path: "/whatsapp",
+              method: "POST",
+              hint: "Set this in Twilio console",
+            },
+            {
+              label: "Afterlife Lead Data Webhook",
+              path: "/webhook/lead-data",
+              method: "POST",
+              hint: "Set this in Afterlife workflow webhook node",
+            },
           ].map((w) => (
             <div key={w.path} className="py-3 border-b border-[#1a1a26] last:border-0">
               <div className="flex items-center justify-between">
                 <p className="font-medium text-[#e0e0f0] text-sm">{w.label}</p>
-                <span className="text-xs bg-indigo-500/15 text-indigo-400 border border-indigo-500/20 px-2 py-0.5 rounded font-mono">{w.method}</span>
+                <span className="text-xs bg-indigo-500/15 text-indigo-400 border border-indigo-500/20 px-2 py-0.5 rounded font-mono">
+                  {w.method}
+                </span>
               </div>
-              <p className="text-xs text-indigo-400/70 font-mono mt-1 break-all">{adapterUrl}{w.path}</p>
+              <p className="text-xs text-indigo-400/70 font-mono mt-1">
+                {"<your-adapter-url>"}
+                {w.path}
+              </p>
               <p className="text-xs text-[#44445a] mt-0.5">{w.hint}</p>
             </div>
           ))}
         </div>
+      </section>
+
+      {/* Session */}
+      <section className={sectionCls}>
+        <h2 className="font-semibold text-white">Session</h2>
+        <p className="text-sm text-[#8888aa]">
+          You are logged in as administrator. Sessions expire after 12 hours.
+        </p>
+        <button
+          onClick={handleLogout}
+          disabled={loggingOut}
+          className="flex items-center gap-2 text-sm bg-[#1a1a28] border border-[#2a2a3a] text-[#8888aa] px-4 py-2 rounded-lg hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-400 transition-colors disabled:opacity-50"
+        >
+          <LogOut size={14} />
+          {loggingOut ? "Logging out…" : "Log out"}
+        </button>
       </section>
 
       {/* About */}
