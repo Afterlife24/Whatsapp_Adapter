@@ -11,6 +11,8 @@ import { cn } from "@/lib/utils";
 import RecordPaymentPanel from "@/components/billing/RecordPaymentPanel";
 import PaymentsList from "@/components/billing/PaymentsList";
 import LedgerTable from "@/components/billing/LedgerTable";
+import CurrencySettingCard from "@/components/billing/CurrencySettingCard";
+import WorkflowsCard from "@/components/billing/WorkflowsCard";
 import { CopyButton, HealthBadge, Notice, Skeleton, buttonCls, cardCls, focusRing } from "@/components/billing/ui";
 
 const timeFormat = new Intl.DateTimeFormat("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
@@ -167,12 +169,16 @@ export default function BillingAccountPage() {
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(340px,400px)]">
         <BalanceCard account={account} />
 
-        <aside className="lg:col-start-2 lg:row-span-3 lg:row-start-1">
-          <div className="lg:sticky lg:top-6">
+        <aside className="lg:col-start-2 lg:row-span-4 lg:row-start-1 space-y-6">
+          <div className="lg:sticky lg:top-6 space-y-6">
+            <CurrencySettingCard account={account} onChanged={load} />
             <RecordPaymentPanel account={account} onRecorded={load} />
           </div>
         </aside>
 
+        <div className="min-w-0 lg:col-start-1">
+          <WorkflowsCard workflows={detail.workflows} />
+        </div>
         <div className="min-w-0 lg:col-start-1">
           <PaymentsList payments={payments} onChanged={load} />
         </div>
@@ -255,7 +261,10 @@ function BalanceCard({ account }: { account: BillingAccount }) {
         )}
 
         <dl className="mt-6 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-[#1e1e2e] bg-[#1e1e2e] sm:grid-cols-3">
-          <Fact label="Customer sees">{currency}</Fact>
+          <Fact label="Customer sees">
+            {currency}
+            <span className="block text-[11px] font-normal text-[#55556b]">set below</span>
+          </Fact>
           <Fact label="Display rate">
             {nonUsd && rate ? (
               <>

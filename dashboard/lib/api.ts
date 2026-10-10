@@ -243,10 +243,28 @@ export interface Payment {
   created_at: string;
 }
 
+export interface OrgWorkflow {
+  id: number;
+  name: string | null;
+  status: string | null;
+  workflow_uuid: string | null;
+}
+
 export interface BillingAccountDetail {
   account: BillingAccount;
   ledger: Ledger;
   payments: Payment[];
+  /** The org's AgentPlatform workflows — display only; billing is per-org. */
+  workflows: OrgWorkflow[];
+}
+
+/** An AgentX organization in the directory picker. */
+export interface OrgDirectoryEntry {
+  organization_id: number;
+  email: string | null;
+  workflow_count: number;
+  /** True when this org already has a billing account in this console. */
+  already_added: boolean;
 }
 
 export interface RecordPaymentInput {
@@ -261,19 +279,20 @@ export interface RecordPaymentInput {
   client_request_id: string;
 }
 
-export const resolveBillingAccount = (agentPhone: string) =>
-  req<WalletBalance>("/adapter/billing/resolve", {
-    method: "POST",
-    body: JSON.stringify({ agent_phone: agentPhone }),
-  });
-
 export const getBillingAccounts = () =>
   req<BillingAccount[]>("/adapter/billing/accounts");
 
-export const createBillingAccount = (agentPhone: string, label: string) =>
+/** List every AgentX organization for the 'Add account' picker. */
+export const listOrganizations = () =>
+  req<{ organizations: OrgDirectoryEntry[] }>("/adapter/billing/organizations").then(
+    (r) => r.organizations,
+  );
+
+/** Create a billing account for an organization (chosen by org id). */
+export const createBillingAccount = (organizationId: number, label: string) =>
   req<BillingAccount>("/adapter/billing/accounts", {
     method: "POST",
-    body: JSON.stringify({ agent_phone: agentPhone, label }),
+    body: JSON.stringify({ organization_id: organizationId, label }),
   });
 
 export const getBillingAccount = (organizationId: number) =>
@@ -288,6 +307,28 @@ export const recordPayment = (organizationId: number, input: RecordPaymentInput)
 export const retryPayment = (paymentId: string) =>
   req<Payment>(`/adapter/billing/payments/${encodeURIComponent(paymentId)}/retry`, {
     method: "POST",
+  });
+
+export interface SetCurrencyInput {
+  currency: "INR" | "USD";
+  /** Decimal string; required for INR, omitted/ignored for USD. */
+  fx_rate_to_usd?: string;
+}
+
+export interface SetCurrencyResult {
+  organization_id: number;
+  display_currency: string;
+  display_fx_rate_to_usd: string;
+  balance_usd: string;
+  balance_display: string;
+}
+
+/** Set the account's display currency — the one the customer sees AND the only
+ *  currency payments may be recorded in for this account. */
+export const setAccountCurrency = (organizationId: number, input: SetCurrencyInput) =>
+  req<SetCurrencyResult>(`/adapter/billing/accounts/${organizationId}/currency`, {
+    method: "POST",
+    body: JSON.stringify(input),
   });
 
 /**

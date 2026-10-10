@@ -48,7 +48,6 @@ import {
 } from "@/lib/billing";
 import { cn } from "@/lib/utils";
 import {
-  Notice,
   Spinner,
   SummaryRow,
   buttonCls,
@@ -97,7 +96,11 @@ export default function RecordPaymentPanel({ account, onRecorded }: Props) {
   };
 
   const accountCurrency = (account.display_currency ?? "USD").toUpperCase();
-  const [currency, setCurrency] = useState<PaymentCurrency>(accountCurrency === "USD" ? "USD" : "INR");
+  // The payment currency is LOCKED to the account's chosen currency. The admin
+  // sets it in the Billing-currency card; the operator cannot record in the
+  // other currency here (the backend also enforces this). So there is no
+  // currency toggle on this form any more — it always equals accountCurrency.
+  const currency: PaymentCurrency = accountCurrency === "USD" ? "USD" : "INR";
   const [amount, setAmount] = useState("");
   const [rate, setRate] = useState(DEFAULT_USD_INR_RATE);
   const [note, setNote] = useState("");
@@ -136,7 +139,6 @@ export default function RecordPaymentPanel({ account, onRecorded }: Props) {
   const creditIsZero = creditUsd !== null && creditUsd <= BigInt(0);
 
   const valid = minor !== null && creditUsd !== null && !creditIsZero && (currency === "USD" || rateValue !== null);
-  const switchesCurrency = currency !== accountCurrency;
   const rateEdited = currency === "INR" && rate.trim() !== DEFAULT_USD_INR_RATE;
   const perDollar = rateValue ? inverseRate(rateValue) : null;
 
@@ -232,39 +234,45 @@ export default function RecordPaymentPanel({ account, onRecorded }: Props) {
       {/* ── Form ─────────────────────────────────────────────────────── */}
       {stage === "form" && (
         <form onSubmit={handleReview} noValidate className="space-y-5 p-5">
-          {/* Currency */}
-          <fieldset>
-            <legend className={labelCls}>Paid in</legend>
-            <div className="grid grid-cols-2 gap-1 rounded-lg border border-[#2a2a3a] bg-[#0a0a0f] p-1">
+          {/* Currency — LOCKED to the account's chosen currency. The non-account
+              option is shown disabled so it's clear why it can't be picked. */}
+          <div>
+            <p className={labelCls}>Paid in</p>
+            <div
+              role="group"
+              aria-label={`Payment currency, locked to ${currency}`}
+              className="grid grid-cols-2 gap-1 rounded-lg border border-[#2a2a3a] bg-[#0a0a0f] p-1"
+            >
               {CURRENCIES.map(({ code, name }) => {
                 const active = currency === code;
                 return (
-                  <label
+                  <div
                     key={code}
+                    title={
+                      active
+                        ? `This account is set to ${code}`
+                        : `Locked: this account is set to ${currency}. Change it in Billing currency.`
+                    }
+                    aria-label={active ? `${name} (${code}), selected` : `${name} (${code}), disabled`}
                     className={cn(
-                      "relative flex cursor-pointer items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-                      active ? "bg-indigo-600 text-white shadow" : "text-[#8888aa] hover:text-white"
+                      "relative flex items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium",
+                      active
+                        ? "bg-indigo-600 text-white shadow"
+                        : "cursor-not-allowed text-[#44445a] opacity-50"
                     )}
                   >
-                    <input
-                      type="radio"
-                      name="payment-currency"
-                      value={code}
-                      checked={active}
-                      onChange={() => setCurrency(code)}
-                      className="peer sr-only"
-                      aria-label={`${name} (${code})`}
-                    />
-                    <span className="pointer-events-none absolute inset-0 rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-indigo-400" />
                     <span aria-hidden="true" className="tabular-nums opacity-80">
                       {currencySymbol(code)}
                     </span>
                     {code}
-                  </label>
+                  </div>
                 );
               })}
             </div>
-          </fieldset>
+            <p className="mt-1 text-xs text-[#44445a]">
+              Fixed by this account&apos;s billing currency. Change it in the Billing-currency card above.
+            </p>
+          </div>
 
           {/* Amount */}
           <div>
@@ -373,17 +381,10 @@ export default function RecordPaymentPanel({ account, onRecorded }: Props) {
           </div>
 
           {/* Display-currency side effect */}
-          {switchesCurrency ? (
-            <Notice tone="amber" icon={<TriangleAlert size={15} />} title={`Switches the customer to ${currency}`}>
-              After this payment, {account.label}&apos;s billing screen shows balances in {currency} instead of{" "}
-              {accountCurrency}.
-            </Notice>
-          ) : (
-            <p className="flex items-start gap-2 text-xs text-[#66667f]">
-              <Info size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-              The customer keeps seeing balances in {currency}. Recording in the other currency would switch them.
-            </p>
-          )}
+          <p className="flex items-start gap-2 text-xs text-[#66667f]">
+            <Info size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+            Recorded in {currency}, this account&apos;s billing currency.
+          </p>
 
           {/* Reference + operator */}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
@@ -442,15 +443,7 @@ export default function RecordPaymentPanel({ account, onRecorded }: Props) {
                 <SummaryRow label="Exchange rate">1 INR = {trimRate(rateValue)} USD</SummaryRow>
               )}
               {note.trim() && <SummaryRow label="Reference">{note.trim()}</SummaryRow>}
-              <SummaryRow label="Customer currency">
-                {switchesCurrency ? (
-                  <span className="text-amber-300">
-                    {accountCurrency} → {currency}
-                  </span>
-                ) : (
-                  currency
-                )}
-              </SummaryRow>
+              <SummaryRow label="Customer currency">{currency}</SummaryRow>
               <SummaryRow label="Wallet credit" emphasis>
                 {creditUsdText ? formatMoney(creditUsdText, "USD") : "—"}
                 {creditUsdText && (

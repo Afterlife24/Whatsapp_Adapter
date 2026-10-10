@@ -2029,22 +2029,65 @@ async def billing_list_accounts(_auth: bool = Depends(require_operator)):
     return accounts
 
 
+@app.get("/adapter/billing/organizations")
+async def billing_list_organizations(_auth: bool = Depends(require_operator)):
+    """List every AgentX organization (email + org id + workflow count).
+
+    Powers the org picker in 'Add account'. Also marks which orgs already have
+    a billing account here, so the UI can disable them.
+    """
+    result = await _agentx_internal("GET", "/organizations")
+    orgs = result.get("organizations", [])
+
+    # Mark orgs that already have a billing account in this console.
+    linked_ids: set[int] = set()
+    if billing_accounts_collection is not None:
+        async for doc in billing_accounts_collection.find({}, {"organization_id": 1}):
+            linked_ids.add(doc["organization_id"])
+
+    for org in orgs:
+        org["already_added"] = org.get("organization_id") in linked_ids
+
+    return {"organizations": orgs}
+
+
 @app.post("/adapter/billing/accounts")
 async def billing_create_account(
     request: Request, _auth: bool = Depends(require_operator)
 ):
-    """Create a billing account by resolving the org from an agent's API key."""
+    """Create a billing account for an organization.
+
+    Billing is per-org: the operator picks an org (by org id) from the
+    directory. The org is validated against AgentX, which also returns the
+    owner email. Legacy callers may still pass agent_phone to resolve the org
+    from an agent's API key.
+    """
     if billing_accounts_collection is None:
         raise HTTPException(status_code=503, detail="MongoDB unavailable")
 
     data = await request.json()
-    agent_phone = (data.get("agent_phone") or "").strip()
     label = (data.get("label") or "").strip()
-    if not agent_phone:
-        raise HTTPException(status_code=400, detail="agent_phone is required")
+    organization_id = data.get("organization_id")
+    agent_phone = (data.get("agent_phone") or "").strip()
 
-    resolved = await _resolve_org_from_agent(agent_phone)
-    organization_id = resolved["organization_id"]
+    # Resolve the org — preferred path is an explicit organization_id; the
+    # agent_phone path is kept for backward compatibility.
+    if organization_id is not None:
+        if not isinstance(organization_id, int):
+            raise HTTPException(
+                status_code=400, detail="organization_id must be an integer"
+            )
+        resolved = await _agentx_internal(
+            "POST", "/resolve-account", {"organization_id": organization_id}
+        )
+    elif agent_phone:
+        resolved = await _resolve_org_from_agent(agent_phone)
+        organization_id = resolved["organization_id"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="organization_id (or agent_phone) is required",
+        )
 
     existing = await billing_accounts_collection.find_one(
         {"organization_id": organization_id}
@@ -2055,13 +2098,16 @@ async def billing_create_account(
             detail=f"Billing account for org {organization_id} already exists",
         )
 
-    clean_phone = agent_phone.replace("whatsapp:", "").strip()
     now = datetime.now(timezone.utc)
     doc = {
         "organization_id": organization_id,
         "email": resolved.get("email"),  # from AgentX, display only
         "label": label or resolved.get("email") or f"Org {organization_id}",
-        "agent_numbers": [clean_phone],
+        # Agent numbers are no longer how an account is chosen, but keep the
+        # field (empty) so existing serialization/consumers stay happy.
+        "agent_numbers": [agent_phone.replace("whatsapp:", "").strip()]
+        if agent_phone
+        else [],
         "created_at": now,
         "updated_at": now,
     }
@@ -2110,7 +2156,57 @@ async def billing_account_detail(
         async for pdoc in cursor:
             payments.append(_serialize_payment(pdoc))
 
-    return {"account": account, "ledger": ledger, "payments": payments}
+    # Org's workflows (display only — billing is per-org, not per-workflow).
+    # Non-fatal: if AgentX hiccups, show the account without the list.
+    workflows = []
+    try:
+        wf = await _agentx_internal("GET", f"/{organization_id}/workflows")
+        workflows = wf.get("workflows", [])
+    except HTTPException:
+        workflows = []
+
+    return {
+        "account": account,
+        "ledger": ledger,
+        "payments": payments,
+        "workflows": workflows,
+    }
+
+
+@app.post("/adapter/billing/accounts/{organization_id}/currency")
+async def billing_set_currency(
+    organization_id: int, request: Request, _auth: bool = Depends(require_operator)
+):
+    """Set the account's display currency (admin choice: INR or USD).
+
+    This fixes the currency shown to the customer AND the only currency in
+    which payments may be recorded for this account. USD needs no rate; INR
+    (or any non-USD) requires a positive fx rate (1 unit = X USD).
+    """
+    data = await request.json()
+    currency = (data.get("currency") or "").strip().upper()
+    if currency not in ("INR", "USD"):
+        raise HTTPException(status_code=400, detail="currency must be INR or USD")
+
+    payload: dict = {"display_currency": currency}
+    if currency == "USD":
+        payload["fx_rate_to_usd"] = "1"
+    else:
+        rate = data.get("fx_rate_to_usd")
+        if rate is None or str(rate).strip() == "":
+            raise HTTPException(
+                status_code=400,
+                detail=f"{currency} requires an exchange rate (fx_rate_to_usd)",
+            )
+        payload["fx_rate_to_usd"] = str(rate)
+
+    result = await _agentx_internal(
+        "POST", f"/{organization_id}/currency", payload
+    )
+    logger.info(
+        f"Billing account org {organization_id} currency set to {currency}"
+    )
+    return result
 
 
 async def _execute_grant(payment_doc: dict) -> dict:

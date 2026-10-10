@@ -235,7 +235,6 @@ export default function BillingPage() {
       {dialogOpen && (
         <AddAccountDialog
           onClose={() => setDialogOpen(false)}
-          accounts={accounts ?? []}
           onCreated={(account) => {
             setDialogOpen(false);
             router.push(`/billing/${account.organization_id}`);
