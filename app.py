@@ -6,9 +6,10 @@ into Dograh workflow executions and sends the assistant's reply back
 via Twilio.
 
 Includes:
-- Conversation tracking in MongoDB (for dashboard visibility)
+- Conversation tracking in PostgreSQL (single source of truth with AgentX)
 - Human takeover mode (pause AI, let human respond from dashboard)
 - Dashboard API endpoints for viewing/managing conversations
+- Operator billing console (reads wallet data from AgentX via internal API)
 
 Supports multiple agents/numbers: configure AGENT_MAPPINGS to map
 each Twilio WhatsApp number to its Dograh API key + trigger UUID.
@@ -17,10 +18,13 @@ each Twilio WhatsApp number to its Dograh API key + trigger UUID.
 import asyncio
 import json
 import os
+import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import asyncpg
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, Response, Cookie, Depends
@@ -28,10 +32,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
 from loguru import logger
-from bson import ObjectId
-from bson.errors import InvalidId
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -56,13 +56,15 @@ DOGRAH_INTERNAL_SECRET = os.getenv("DOGRAH_INTERNAL_SECRET", "")
 DOGRAH_API_KEY = os.getenv("DOGRAH_API_KEY", "")
 DOGRAH_TRIGGER_PATH = os.getenv("DOGRAH_TRIGGER_PATH", "")
 
-# Twilio account-level credentials (same for all numbers; per-number routing comes from MongoDB)
+# Twilio account-level credentials (same for all numbers; per-number routing comes from DB)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
-# MongoDB config
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "whatsapp_adapter")
+# PostgreSQL — same database as AgentX (single source of truth)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@postgres:5432/postgres",
+)
 
 # Adapter authentication (Phase 1)
 ADAPTER_ADMIN_PASSWORD = os.getenv("ADAPTER_ADMIN_PASSWORD")
@@ -88,15 +90,10 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     logger.info("Twilio client initialized")
 
 # For multi-agent setups, define a JSON mapping in the env:
-# AGENT_MAPPINGS = {
-#   "+14155551234": {"api_key": "dk_xxx", "trigger_path": "uuid-xxx"},
-#   "+14155555678": {"api_key": "dk_yyy", "trigger_path": "uuid-yyy"}
-# }
-
-# AGENT_MAPPINGS from env — used ONLY for one-time migration to MongoDB on first startup.
-# After migration, all agent config is read from the 'agents' MongoDB collection.
+#   AGENT_MAPPINGS='{ "+14155551234": { "api_key": "dgr_xxx", "trigger_path": "uuid", ... } }'
+# Used ONLY for one-time migration to PostgreSQL on first deploy.
 AGENT_MAPPINGS: dict = {}
-_raw_mappings = os.getenv("AGENT_MAPPINGS", "")
+_raw_mappings = os.getenv("AGENT_MAPPINGS", "").strip()
 if _raw_mappings:
     try:
         AGENT_MAPPINGS = json.loads(_raw_mappings)
@@ -104,115 +101,43 @@ if _raw_mappings:
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse AGENT_MAPPINGS: {e}")
 
-
-async def _get_agent_doc(to_number: str) -> dict:
-    """Look up agent config from MongoDB agents collection by phone number."""
-    clean = to_number.replace("whatsapp:", "").strip()
-    if agents_collection is not None:
-        doc = await agents_collection.find_one({"phone_number": clean, "is_active": True})
-        if doc:
-            return doc
-    raise ValueError(
-        f"No agent found for number {to_number}. Add it via the dashboard."
-    )
-
-
-async def _get_agent_config(to_number: str) -> tuple[str, str]:
-    """Resolve which API key + trigger to use for a given Twilio number."""
-    doc = await _get_agent_doc(to_number)
-    return doc["api_key"], doc["trigger_path"]
-
-
-async def _get_agent_mapping(to_number: str) -> dict:
-    """Get the full agent config dict for a Twilio number."""
-    try:
-        return await _get_agent_doc(to_number)
-    except ValueError:
-        return {}
-
-
-async def _migrate_env_agents_to_db() -> None:
-    """One-time migration: move AGENT_MAPPINGS from .env into MongoDB agents collection.
-
-    Runs at startup. If the agents collection already has documents, skip.
-    This ensures existing agents are preserved after the first deploy.
-    """
-    if agents_collection is None or not AGENT_MAPPINGS:
-        return
-    count = await agents_collection.count_documents({})
-    if count > 0:
-        logger.info(f"✅ Agents collection has {count} agent(s) — skipping migration")
-        return
-    docs = []
-    for phone_number, mapping in AGENT_MAPPINGS.items():
-        agent_name = mapping.get("agent_name", f"Agent {phone_number}")
-        collection_prefix = agent_name.lower().replace(" ", "_").replace("-", "_")
-        doc = {
-            "phone_number": phone_number,
-            "agent_name": agent_name,
-            "collection_prefix": collection_prefix,
-            "api_key": mapping.get("api_key", ""),
-            "trigger_path": mapping.get("trigger_path", ""),
-            "followups_enabled": mapping.get("followups_enabled", False),
-            "followup_delays": mapping.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS),
-            "greeting_message": mapping.get("greeting", ""),
-            "greeting_image_url": mapping.get("greeting_image_url", ""),
-            "greeting_window_hours": mapping.get("greeting_window_hours", 12),
-            "store_leads": mapping.get("store_leads", False),
-            "quota_enabled": mapping.get("quota_enabled", False),
-            "quota_limit": mapping.get("quota_limit", 500),
-            "quota_used": mapping.get("quota_used", 0),
-            "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "is_active": True,
-            "created_at": datetime.now(timezone.utc),
-        }
-        docs.append(doc)
-    if docs:
-        await agents_collection.insert_many(docs)
-        logger.info(f"✅ Migrated {len(docs)} agent(s) from .env to MongoDB")
-
-
-# Follow-up delays (in seconds). Per-agent override via "followup_delays" key.
-DEFAULT_FOLLOWUP_DELAYS = [300, 900, 1800, 10800]  # 5m, 15m, 30m, 3h
+# Follow-up defaults
+DEFAULT_FOLLOWUP_DELAYS = [300, 900, 1800]  # 5m, 15m, 30m
 
 
 # ---------------------------------------------------------------------------
-# MongoDB
+# PostgreSQL connection pool
 # ---------------------------------------------------------------------------
 
-mongo_client: AsyncIOMotorClient | None = None
-db = None
-sessions_collection = None
-chats_collection = None
-agents_collection = None
-billing_accounts_collection = None  # Phase 6: operator billing accounts
-payments_collection = None  # Phase 6: recorded payments (two-phase grant)
+pg_pool: asyncpg.Pool | None = None
 
-# In-memory fallback (if MongoDB is unavailable)
+
+# In-memory fallback (if PostgreSQL is unavailable)
 SESSIONS_STORE: dict = {}  # phone_number -> session dict
 MESSAGE_STORE: dict = {}  # phone_number -> list of messages
 
-# Dashboard cache
+# Conversations cache (30s TTL)
 CONVERSATIONS_CACHE: dict = {"data": None, "expires_at": 0}
 
 
 # ---------------------------------------------------------------------------
-# App
+# FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="WhatsApp-Dograh Adapter")
 
-# CORS — allow the dashboard to connect (locked down to a specific origin).
-# Prefer ADAPTER_CORS_ORIGIN (the Phase 8 config name); fall back to the
-# Phase 1 name DASHBOARD_ORIGIN so existing deployments keep working.
-DASHBOARD_ORIGIN = (
-    os.getenv("ADAPTER_CORS_ORIGIN")
-    or os.getenv("DASHBOARD_ORIGIN")
-    or "http://localhost:3001"
-)
+# CORS — allow the dashboard and AgentX UI to connect.
+# Supports multiple origins via comma-separated ADAPTER_CORS_ORIGINS env var.
+_cors_raw = os.getenv("ADAPTER_CORS_ORIGINS") or os.getenv("DASHBOARD_ORIGIN") or ""
+ALLOWED_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()] or [
+    "http://localhost:3000",              # AgentX UI (via nginx)
+    "http://localhost:3001",              # Adapter dashboard
+    "http://localhost:3010",              # AgentX UI (direct)
+    "https://devagents.afterlife.org.in", # Production
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[DASHBOARD_ORIGIN],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -242,16 +167,17 @@ async def login(request: Request):
     if password != ADAPTER_ADMIN_PASSWORD:
         logger.warning(f"Failed login attempt from {request.client.host}")
         raise HTTPException(status_code=401, detail="Invalid password")
-    
+
     # Create signed session cookie
     token = signer.sign(b"operator").decode()
     response = JSONResponse({"success": True, "message": "Logged in"})
+    is_secure = os.getenv("ADAPTER_COOKIE_SECURE", "").lower() not in ("", "0", "false", "no")
     response.set_cookie(
         key=SESSION_COOKIE,
         value=token,
         max_age=SESSION_MAX_AGE,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=is_secure,
         samesite="lax",
     )
     logger.info(f"✅ Operator logged in from {request.client.host}")
@@ -267,83 +193,225 @@ async def logout():
     return response
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL startup — create tables and connect
+# ---------------------------------------------------------------------------
+
+_CREATE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS wa_agents (
+    id SERIAL PRIMARY KEY,
+    phone_number VARCHAR(50) UNIQUE NOT NULL,
+    agent_name VARCHAR(200) DEFAULT '',
+    api_key TEXT DEFAULT '',
+    trigger_path TEXT DEFAULT '',
+    collection_prefix VARCHAR(100) DEFAULT '',
+    greeting_message TEXT DEFAULT '',
+    greeting_image_url TEXT DEFAULT '',
+    greeting_window_hours INTEGER DEFAULT 0,
+    completion_message TEXT DEFAULT '',
+    followups_enabled BOOLEAN DEFAULT FALSE,
+    followup_delays JSONB DEFAULT '[300, 900, 1800]'::jsonb,
+    followup_messages JSONB DEFAULT '[]'::jsonb,
+    store_leads BOOLEAN DEFAULT FALSE,
+    quota_enabled BOOLEAN DEFAULT FALSE,
+    quota_limit INTEGER DEFAULT 500,
+    quota_used INTEGER DEFAULT 0,
+    quota_reset_date VARCHAR(20) DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS wa_sessions (
+    id SERIAL PRIMARY KEY,
+    phone_number VARCHAR(100) UNIQUE NOT NULL,
+    agent_number VARCHAR(100) DEFAULT '',
+    human_takeover BOOLEAN DEFAULT FALSE,
+    takeover_context TEXT DEFAULT '',
+    pending_handoff BOOLEAN DEFAULT FALSE,
+    lead_status VARCHAR(20) DEFAULT 'active',
+    followup_stage INTEGER DEFAULT 0,
+    last_activity TIMESTAMPTZ DEFAULT NOW(),
+    last_agent_reply_at TIMESTAMPTZ DEFAULT NOW(),
+    message_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS wa_chats (
+    id SERIAL PRIMARY KEY,
+    phone_number VARCHAR(100) NOT NULL,
+    sender VARCHAR(100) NOT NULL,
+    content TEXT DEFAULT '',
+    type VARCHAR(20) DEFAULT 'user',
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS wa_leads (
+    id SERIAL PRIMARY KEY,
+    phone_number VARCHAR(100) DEFAULT '',
+    agent_number VARCHAR(100) DEFAULT '',
+    patient_name VARCHAR(200) DEFAULT '',
+    concern TEXT DEFAULT '',
+    city VARCHAR(200) DEFAULT '',
+    locality VARCHAR(200) DEFAULT '',
+    city_locality VARCHAR(200) DEFAULT '',
+    user_location TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    lead_status VARCHAR(20) DEFAULT 'completed',
+    workflow_run_id VARCHAR(200) DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_wa_chats_phone_ts ON wa_chats(phone_number, timestamp);
+CREATE INDEX IF NOT EXISTS idx_wa_chats_phone_sender ON wa_chats(phone_number, sender);
+CREATE INDEX IF NOT EXISTS idx_wa_sessions_agent ON wa_sessions(agent_number);
+CREATE INDEX IF NOT EXISTS idx_wa_sessions_status ON wa_sessions(lead_status);
+CREATE INDEX IF NOT EXISTS idx_wa_leads_created ON wa_leads(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wa_leads_agent ON wa_leads(agent_number);
+"""
+
+
 @app.on_event("startup")
 async def startup():
-    """Initialize MongoDB connection and indexes."""
-    global mongo_client, db, sessions_collection, chats_collection, agents_collection
-    global billing_accounts_collection, payments_collection
-
+    """Initialize PostgreSQL connection pool and create tables."""
+    global pg_pool
     try:
-        mongo_client = AsyncIOMotorClient(
-            MONGODB_URL, serverSelectionTimeoutMS=5000)
-        # Verify connection
-        await mongo_client.admin.command("ping")
-        db = mongo_client[MONGODB_DATABASE]
-        sessions_collection = db["sessions"]
-        chats_collection = db["chats"]
-        agents_collection = db["agents"]
-        billing_accounts_collection = db["billing_accounts"]
-        payments_collection = db["payments"]
+        pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_CREATE_TABLES_SQL)
+        logger.info("✅ Connected to PostgreSQL")
 
-        # Create indexes
-        await sessions_collection.create_index("phone_number", unique=True)
-        await chats_collection.create_index([("phone_number", 1), ("timestamp", 1)])
-        await agents_collection.create_index("phone_number", unique=True)
-
-        # Phase 6: billing collections.
-        # One account per AgentX organization.
-        await billing_accounts_collection.create_index(
-            "organization_id", unique=True
-        )
-        # Payments listed newest-first per org, and filterable by status.
-        await payments_collection.create_index(
-            [("organization_id", 1), ("created_at", -1)]
-        )
-        await payments_collection.create_index("status")
-        # One payment per browser submission. The dashboard generates this id
-        # when the operator reviews a payment and reuses it on every resubmit,
-        # so a lost response + second click can't create a second payment.
-        # Sparse: older payments without the field are not indexed.
-        await payments_collection.create_index(
-            "client_request_id", unique=True, sparse=True
-        )
-
-        logger.info(f"✅ Connected to MongoDB: {MONGODB_DATABASE}")
-
-        # One-time migration: .env AGENT_MAPPINGS → MongoDB agents collection
+        # One-time migration: .env AGENT_MAPPINGS → PostgreSQL
         await _migrate_env_agents_to_db()
     except Exception as e:
-        logger.warning(
-            f"⚠️ MongoDB unavailable ({e}), using in-memory storage")
-        mongo_client = None
+        logger.warning(f"⚠️ PostgreSQL unavailable ({e}), using in-memory storage")
+        pg_pool = None
 
     # Start follow-up scheduler
     asyncio.create_task(_followup_loop())
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Agent helpers
 # ---------------------------------------------------------------------------
 
+async def _get_agent_doc(to_number: str) -> dict:
+    """Look up agent config from wa_agents table by phone number."""
+    clean = to_number.replace("whatsapp:", "").strip()
+    if pg_pool is not None:
+        row = await pg_pool.fetchrow(
+            "SELECT * FROM wa_agents WHERE phone_number = $1 AND is_active = true",
+            clean,
+        )
+        if row:
+            return _row_to_dict(row)
+    raise ValueError(
+        f"No agent found for number {to_number}. Add it via the dashboard."
+    )
+
+
+async def _get_agent_config(to_number: str) -> tuple[str, str]:
+    """Resolve which API key + trigger to use for a given Twilio number."""
+    doc = await _get_agent_doc(to_number)
+    return doc["api_key"], doc["trigger_path"]
+
+
+async def _get_agent_mapping(to_number: str) -> dict:
+    """Get the full agent config dict for a Twilio number."""
+    try:
+        return await _get_agent_doc(to_number)
+    except ValueError:
+        return {}
+
+
+def _row_to_dict(row) -> dict:
+    """Convert an asyncpg Record to a plain dict, deserializing JSONB fields."""
+    if row is None:
+        return {}
+    d = dict(row)
+    # asyncpg returns JSONB as Python objects already — no extra parsing needed
+    return d
+
+
+async def _migrate_env_agents_to_db() -> None:
+    """One-time migration: move AGENT_MAPPINGS from .env into wa_agents table.
+
+    Runs at startup. If the wa_agents table already has documents, skip.
+    This ensures existing agents are preserved after the first deploy.
+    """
+    if pg_pool is None or not AGENT_MAPPINGS:
+        return
+    count = await pg_pool.fetchval("SELECT COUNT(*) FROM wa_agents")
+    if count > 0:
+        logger.info(f"✅ wa_agents has {count} agent(s) — skipping migration")
+        return
+
+    logger.info(f"🔄 Migrating {len(AGENT_MAPPINGS)} agents from env to PostgreSQL...")
+    for phone_number, config in AGENT_MAPPINGS.items():
+        clean = phone_number.replace("whatsapp:", "").strip()
+        agent_name = config.get("agent_name", clean)
+        prefix = config.get("collection_prefix", "")
+        if not prefix:
+            prefix = re.sub(r"[^a-z0-9]+", "_", agent_name.lower().strip()).strip("_")
+        now = datetime.now(timezone.utc)
+        try:
+            await pg_pool.execute(
+                """INSERT INTO wa_agents (
+                    phone_number, agent_name, api_key, trigger_path,
+                    collection_prefix, greeting_message, greeting_image_url,
+                    greeting_window_hours, followups_enabled, followup_delays,
+                    followup_messages, store_leads, quota_enabled, quota_limit,
+                    is_active, created_at, updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17)
+                ON CONFLICT (phone_number) DO NOTHING""",
+                clean,
+                agent_name,
+                config.get("api_key", ""),
+                config.get("trigger_path", ""),
+                prefix,
+                config.get("greeting_message", ""),
+                config.get("greeting_image_url", ""),
+                config.get("greeting_window_hours", 0),
+                config.get("followups_enabled", False),
+                json.dumps(config.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS)),
+                json.dumps(config.get("followup_messages", [])),
+                config.get("store_leads", False),
+                config.get("quota_enabled", False),
+                config.get("quota_limit", 500),
+                config.get("is_active", True),
+                now, now,
+            )
+            logger.info(f"  ✅ Migrated agent: {agent_name} ({clean})")
+        except Exception as e:
+            logger.error(f"  ❌ Failed to migrate {clean}: {e}")
+
+    logger.info("✅ Agent migration complete")
+
+
+# ---------------------------------------------------------------------------
+# Database helpers — sessions
+# ---------------------------------------------------------------------------
 
 async def get_or_create_session(phone_number: str, agent_number: str = "") -> dict:
     """Get or create a session for the given phone number."""
-    if sessions_collection is not None:
-        session = await sessions_collection.find_one({"phone_number": phone_number})
-        if session:
-            return session
-        new_session = {
-            "phone_number": phone_number,
-            "agent_number": agent_number,
-            "human_takeover": False,
-            "lead_status": "active",  # active | completed | not_qualified | inactive
-            "followup_stage": 0,  # 0 = no followup sent yet, 1-3 = followup N sent
-            "last_activity": datetime.now(timezone.utc),
-            "last_agent_reply_at": datetime.now(timezone.utc),
-            "created_at": datetime.now(timezone.utc),
-        }
-        await sessions_collection.insert_one(new_session)
-        return new_session
+    if pg_pool is not None:
+        row = await pg_pool.fetchrow(
+            "SELECT * FROM wa_sessions WHERE phone_number = $1", phone_number
+        )
+        if row:
+            return _row_to_dict(row)
+        now = datetime.now(timezone.utc)
+        row = await pg_pool.fetchrow(
+            """INSERT INTO wa_sessions (
+                phone_number, agent_number, human_takeover, lead_status,
+                followup_stage, last_activity, last_agent_reply_at, created_at
+            ) VALUES ($1,$2,false,'active',0,$3,$3,$3)
+            ON CONFLICT (phone_number) DO UPDATE SET phone_number = wa_sessions.phone_number
+            RETURNING *""",
+            phone_number, agent_number, now,
+        )
+        return _row_to_dict(row)
     else:
         if phone_number not in SESSIONS_STORE:
             SESSIONS_STORE[phone_number] = {
@@ -358,21 +426,27 @@ async def get_or_create_session(phone_number: str, agent_number: str = "") -> di
         return SESSIONS_STORE[phone_number]
 
 
+# ---------------------------------------------------------------------------
+# Database helpers — chats
+# ---------------------------------------------------------------------------
+
 async def store_message(
     phone_number: str, sender: str, content: str, msg_type: str
 ) -> None:
     """Store a message in the database."""
     now = datetime.now(timezone.utc)
 
-    if chats_collection is not None:
-        await chats_collection.insert_one(
-            {
-                "phone_number": phone_number,
-                "sender": sender,
-                "content": content,
-                "timestamp": now,
-                "type": msg_type,
-            }
+    if pg_pool is not None:
+        await pg_pool.execute(
+            """INSERT INTO wa_chats (phone_number, sender, content, type, timestamp)
+               VALUES ($1, $2, $3, $4, $5)""",
+            phone_number, sender, content, msg_type, now,
+        )
+        # Update session last_activity
+        await pg_pool.execute(
+            """UPDATE wa_sessions SET last_activity = $2, message_count = message_count + 1
+               WHERE phone_number = $1""",
+            phone_number, now,
         )
     else:
         if phone_number not in MESSAGE_STORE:
@@ -386,48 +460,47 @@ async def store_message(
             }
         )
 
-    # Update session last_activity
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": {"last_activity": now}, "$inc": {"message_count": 1}},
-            upsert=True,
-        )
-
     # Invalidate conversations cache
     CONVERSATIONS_CACHE.clear()
 
 
+# ---------------------------------------------------------------------------
+# Database helpers — session state
+# ---------------------------------------------------------------------------
+
 async def get_human_takeover_status(phone_number: str) -> bool:
     """Check if a conversation is in human takeover mode."""
-    if sessions_collection is not None:
-        session = await sessions_collection.find_one({"phone_number": phone_number})
-        return session.get("human_takeover", False) if session else False
+    if pg_pool is not None:
+        val = await pg_pool.fetchval(
+            "SELECT human_takeover FROM wa_sessions WHERE phone_number = $1",
+            phone_number,
+        )
+        return bool(val)
     else:
         session = SESSIONS_STORE.get(phone_number)
         return session.get("human_takeover", False) if session else False
 
 
 async def set_human_takeover(phone_number: str, status: bool, takeover_context: str = "") -> None:
-    """Set human takeover status for a conversation.
-    
-    When activating (status=True), stores takeover_context so AI can resume
-    from the right point when human releases back to AI.
-    """
+    """Set human takeover status for a conversation."""
     now = datetime.now(timezone.utc)
-    update_fields: dict = {"human_takeover": status, "last_activity": now}
-    if status and takeover_context:
-        update_fields["takeover_context"] = takeover_context
-    elif not status:
-        # Clearing takeover — don't wipe context yet, release handler uses it
-        pass
-
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": update_fields},
-            upsert=True,
-        )
+    if pg_pool is not None:
+        if status and takeover_context:
+            await pg_pool.execute(
+                """INSERT INTO wa_sessions (phone_number, human_takeover, takeover_context, last_activity)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (phone_number) DO UPDATE
+                   SET human_takeover = $2, takeover_context = $3, last_activity = $4""",
+                phone_number, status, takeover_context, now,
+            )
+        else:
+            await pg_pool.execute(
+                """INSERT INTO wa_sessions (phone_number, human_takeover, last_activity)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (phone_number) DO UPDATE
+                   SET human_takeover = $2, last_activity = $3""",
+                phone_number, status, now,
+            )
     else:
         if phone_number not in SESSIONS_STORE:
             SESSIONS_STORE[phone_number] = {"phone_number": phone_number}
@@ -442,14 +515,12 @@ async def set_human_takeover(phone_number: str, status: bool, takeover_context: 
 async def _reset_followup(phone_number: str) -> None:
     """Reset follow-up stage when user replies (they're active again)."""
     now = datetime.now(timezone.utc)
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": {
-                "followup_stage": 0,
-                "last_activity": now,
-                "last_agent_reply_at": now,
-            }},
+    if pg_pool is not None:
+        await pg_pool.execute(
+            """UPDATE wa_sessions SET followup_stage = 0,
+               last_activity = $2, last_agent_reply_at = $2
+               WHERE phone_number = $1""",
+            phone_number, now,
         )
     else:
         session = SESSIONS_STORE.get(phone_number)
@@ -462,10 +533,10 @@ async def _reset_followup(phone_number: str) -> None:
 async def _mark_agent_replied(phone_number: str) -> None:
     """Track when the agent last replied (for follow-up timing)."""
     now = datetime.now(timezone.utc)
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": {"last_agent_reply_at": now}},
+    if pg_pool is not None:
+        await pg_pool.execute(
+            "UPDATE wa_sessions SET last_agent_reply_at = $2 WHERE phone_number = $1",
+            phone_number, now,
         )
     else:
         session = SESSIONS_STORE.get(phone_number)
@@ -475,10 +546,10 @@ async def _mark_agent_replied(phone_number: str) -> None:
 
 async def _set_lead_status(phone_number: str, status: str) -> None:
     """Update lead status (active, completed, not_qualified, inactive)."""
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": {"lead_status": status}},
+    if pg_pool is not None:
+        await pg_pool.execute(
+            "UPDATE wa_sessions SET lead_status = $2 WHERE phone_number = $1",
+            phone_number, status,
         )
     else:
         session = SESSIONS_STORE.get(phone_number)
@@ -489,10 +560,10 @@ async def _set_lead_status(phone_number: str, status: str) -> None:
 
 async def _increment_followup(phone_number: str, stage: int) -> None:
     """Set the follow-up stage for a session."""
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": phone_number},
-            {"$set": {"followup_stage": stage}},
+    if pg_pool is not None:
+        await pg_pool.execute(
+            "UPDATE wa_sessions SET followup_stage = $2 WHERE phone_number = $1",
+            phone_number, stage,
         )
     else:
         session = SESSIONS_STORE.get(phone_number)
@@ -500,22 +571,51 @@ async def _increment_followup(phone_number: str, stage: int) -> None:
             session["followup_stage"] = stage
 
 
+async def _update_session_field(phone_number: str, **kwargs) -> None:
+    """Update one or more fields on a session row."""
+    if pg_pool is None:
+        session = SESSIONS_STORE.get(phone_number)
+        if session:
+            session.update(kwargs)
+        return
+    sets = []
+    vals = [phone_number]
+    idx = 2
+    for k, v in kwargs.items():
+        sets.append(f"{k} = ${idx}")
+        vals.append(v)
+        idx += 1
+    if not sets:
+        return
+    sql = f"UPDATE wa_sessions SET {', '.join(sets)} WHERE phone_number = $1"
+    await pg_pool.execute(sql, *vals)
+
+
+async def _get_session(phone_number: str) -> dict | None:
+    """Fetch a session by phone number."""
+    if pg_pool is not None:
+        row = await pg_pool.fetchrow(
+            "SELECT * FROM wa_sessions WHERE phone_number = $1", phone_number
+        )
+        return _row_to_dict(row) if row else None
+    return SESSIONS_STORE.get(phone_number)
+
+
 async def _store_lead_from_chat(phone_number: str) -> None:
     """Store lead data. Uses Dograh's gathered_context if available, else chat parsing."""
-    if db is None:
+    if pg_pool is None:
         return
 
-    # Get session for workflow_run_id
-    session = None
-    if sessions_collection is not None:
-        session = await sessions_collection.find_one({"phone_number": phone_number})
+    # Get session for agent_number
+    session = await _get_session(phone_number)
 
     # Fallback: parse from chat messages
     messages = []
-    if chats_collection is not None:
-        cursor = chats_collection.find(
-            {"phone_number": phone_number}).sort("timestamp", 1)
-        messages = await cursor.to_list(length=100)
+    rows = await pg_pool.fetch(
+        "SELECT sender, content FROM wa_chats WHERE phone_number = $1 ORDER BY timestamp ASC LIMIT 100",
+        phone_number,
+    )
+    messages = [{"sender": r["sender"], "content": r["content"]} for r in rows]
 
     user_msgs = [m["content"] for m in messages if m["sender"] == "user"]
 
@@ -526,7 +626,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
             location = msg.strip()
             break
 
-    # Name: reply after bot asks "name" — skip if reply is "no", "yes", numbers, urls
+    # Name: reply after bot asks "name"
     name = ""
     for i, m in enumerate(messages):
         if m["sender"] == "agent" and "name" in m["content"].lower():
@@ -535,8 +635,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
                     c = messages[j]["content"].strip()
                     if (len(c) < 30 and not c.startswith("http")
                             and not c.isdigit() and c.lower() not in ("no", "yes", "ok", "yah", "yeah")):
-                        name = c.split(" from ")[0].strip(
-                        ) if " from " in c.lower() else c
+                        name = c.split(" from ")[0].strip() if " from " in c.lower() else c
                     break
             if name:
                 break
@@ -573,21 +672,21 @@ async def _store_lead_from_chat(phone_number: str) -> None:
             if concern:
                 break
 
-    lead_doc = {
-        "phone_number": phone_number,
-        "agent_number": session.get("agent_number", "") if session else "",
-        "patient_name": name,
-        "concern": concern,
-        "city_locality": city_locality,
-        "user_location": location,
-        "lead_status": "completed",
-        "created_at": datetime.now(timezone.utc),
-    }
-
-    leads_collection = db["leads"]
-    await leads_collection.insert_one(lead_doc)
-    logger.info(
-        f"💾 Lead stored: {name} | {concern[:50]} | {city_locality} | {location[:50]}")
+    now = datetime.now(timezone.utc)
+    await pg_pool.execute(
+        """INSERT INTO wa_leads (
+            phone_number, agent_number, patient_name, concern,
+            city_locality, user_location, lead_status, created_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,'completed',$7)""",
+        phone_number,
+        session.get("agent_number", "") if session else "",
+        name,
+        concern,
+        city_locality,
+        location,
+        now,
+    )
+    logger.info(f"💾 Lead stored: {name} | {concern[:50]} | {city_locality} | {location[:50]}")
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +696,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mongo": mongo_client is not None}
+    return {"status": "ok", "db": pg_pool is not None}
 
 
 @app.post("/whatsapp")
@@ -620,27 +719,22 @@ async def whatsapp_webhook(
     but NOT forwarded to Dograh — a human will respond from the dashboard.
     """
     # Validate Twilio signature (Task 1.4)
-    if twilio_validator:
-        # Reconstruct full URL using X-Forwarded-Proto and Host headers (for reverse proxies)
+    # Disabled locally when TWILIO_VALIDATE_SIGNATURE is not "true" (e.g. behind ngrok)
+    _validate_sig = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() == "true"
+    if twilio_validator and _validate_sig:
         proto = request.headers.get("X-Forwarded-Proto", "https")
         host = request.headers.get("Host", request.url.hostname or "")
         full_url = f"{proto}://{host}{request.url.path}"
-        
-        # Get Twilio signature from headers
         signature = request.headers.get("X-Twilio-Signature", "")
-        
-        # Build params dict from form data
         form_data = await request.form()
         params = {key: value for key, value in form_data.items()}
-        
-        # Validate signature
         if not twilio_validator.validate(full_url, params, signature):
             logger.warning(f"⚠️ Invalid Twilio signature from {request.client.host}")
             raise HTTPException(status_code=403, detail="Invalid request signature")
-    
+
     user_message = Body.strip()
-    sender = From  # e.g. "whatsapp:+919876543210"
-    receiver = To  # e.g. "whatsapp:+14155551234"
+    sender = From   # e.g. "whatsapp:+919876543210"
+    receiver = To   # e.g. "whatsapp:+14155551234"
 
     # Handle WhatsApp location pins (Twilio sends lat/lng separately)
     if not user_message and Latitude and Longitude:
@@ -656,14 +750,7 @@ async def whatsapp_webhook(
     # Ensure session exists and agent_number is always current receiver
     await get_or_create_session(sender, agent_number=receiver)
     # Always sync agent_number to the number that received this message
-    # This handles cases where a user switches from one agent number to another
-    if sessions_collection is not None:
-        await sessions_collection.update_one(
-            {"phone_number": sender},
-            {"$set": {"agent_number": receiver}}
-        )
-    elif sender in SESSIONS_STORE:
-        SESSIONS_STORE[sender]["agent_number"] = receiver
+    await _update_session_field(sender, agent_number=receiver)
 
     # User replied — reset follow-up timer and stage
     await _reset_followup(sender)
@@ -699,83 +786,64 @@ async def whatsapp_webhook(
         return Response(content=str(resp), media_type="application/xml")
 
     # Check if user is responding to a pending handoff confirmation (BEFORE Dograh call)
-    if sessions_collection is not None:
-        pending_session = await sessions_collection.find_one({"phone_number": sender})
-        if pending_session and pending_session.get("pending_handoff"):
-            msg_lower = user_message.lower().strip()
-            yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
-            no_words  = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
-            is_yes = any(w in msg_lower for w in yes_words)
-            is_no  = any(w in msg_lower for w in no_words)
+    pending_session = await _get_session(sender)
+    if pending_session and pending_session.get("pending_handoff"):
+        msg_lower = user_message.lower().strip()
+        yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
+        no_words  = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
+        is_yes = any(w in msg_lower for w in yes_words)
+        is_no  = any(w in msg_lower for w in no_words)
 
-            if is_yes:
-                takeover_ctx = pending_session.get("takeover_context", "")
-                await sessions_collection.update_one(
-                    {"phone_number": sender},
-                    {"$set": {"pending_handoff": False}}
-                )
-                await set_human_takeover(sender, True, takeover_context=takeover_ctx)
-                confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
-                _send_twilio_reply(sender, confirm_reply, from_number=receiver)
-                await store_message(sender, "agent", confirm_reply, "system")
-                logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
+        if is_yes:
+            takeover_ctx = pending_session.get("takeover_context", "")
+            await _update_session_field(sender, pending_handoff=False)
+            await set_human_takeover(sender, True, takeover_context=takeover_ctx)
+            confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
+            _send_twilio_reply(sender, confirm_reply, from_number=receiver)
+            await store_message(sender, "agent", confirm_reply, "system")
+            logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
-            elif is_no:
-                await sessions_collection.update_one(
-                    {"phone_number": sender},
-                    {"$set": {"pending_handoff": False}, "$unset": {"takeover_context": ""}}
-                )
-                no_reply = "No problem! Our standard fee is Rs.800 per session. Would you like to proceed with booking?"
-                _send_twilio_reply(sender, no_reply, from_number=receiver)
-                await store_message(sender, "agent", no_reply, "ai")
-                await _mark_agent_replied(sender)
-                logger.info(f"❌ User declined handoff — AI continues for {sender}")
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
+        elif is_no:
+            await _update_session_field(sender, pending_handoff=False, takeover_context="")
+            no_reply = "No problem! Our standard fee is Rs.800 per session. Would you like to proceed with booking?"
+            _send_twilio_reply(sender, no_reply, from_number=receiver)
+            await store_message(sender, "agent", no_reply, "ai")
+            await _mark_agent_replied(sender)
+            logger.info(f"❌ User declined handoff — AI continues for {sender}")
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
-            else:
-                retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
-                _send_twilio_reply(sender, retry_msg, from_number=receiver)
-                await store_message(sender, "agent", retry_msg, "system")
-                await _mark_agent_replied(sender)
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
+        else:
+            retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
+            _send_twilio_reply(sender, retry_msg, from_number=receiver)
+            await store_message(sender, "agent", retry_msg, "system")
+            await _mark_agent_replied(sender)
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
     # If lead already completed/inactive/not_qualified — re-engage with fresh greeting
-    if sessions_collection is not None:
-        existing_session = await sessions_collection.find_one({"phone_number": sender})
-        if existing_session and existing_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
-            old_status = existing_session.get("lead_status")
-            logger.info(f"🔄 Re-engaging {sender} (was {old_status}) — resetting session")
-            # Reset lead status, followup stage AND update agent_number to current receiver
-            await _set_lead_status(sender, "active")
-            await _reset_followup(sender)
-            # Always update agent_number to the number that received this message
-            if sessions_collection is not None:
-                await sessions_collection.update_one(
-                    {"phone_number": sender},
-                    {"$set": {"agent_number": receiver}}
-                )
-            elif sender in SESSIONS_STORE:
-                SESSIONS_STORE[sender]["agent_number"] = receiver
-            logger.info(f"🔄 Updated agent_number to {receiver} for {sender}")
-            # Send greeting + image if configured
-            mapping = await _get_agent_mapping(receiver)
-            if mapping.get("greeting_message"):
-                image_url = mapping.get("greeting_image_url", "")
-                _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url, from_number=receiver)
-                await store_message(sender, "agent", mapping["greeting_message"], "ai")
-                await _mark_agent_replied(sender)
-                logger.info(f"👋 Re-engagement greeting sent to {sender}")
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
-            # No greeting configured — fall through and let Dograh handle the message
+    existing_session = await _get_session(sender)
+    if existing_session and existing_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
+        old_status = existing_session.get("lead_status")
+        logger.info(f"🔄 Re-engaging {sender} (was {old_status}) — resetting session")
+        await _set_lead_status(sender, "active")
+        await _reset_followup(sender)
+        await _update_session_field(sender, agent_number=receiver)
+        logger.info(f"🔄 Updated agent_number to {receiver} for {sender}")
+        # Send greeting + image if configured
+        mapping = await _get_agent_mapping(receiver)
+        if mapping.get("greeting_message"):
+            image_url = mapping.get("greeting_image_url", "")
+            _send_twilio_reply(sender, mapping["greeting_message"], media_url=image_url, from_number=receiver)
+            await store_message(sender, "agent", mapping["greeting_message"], "ai")
+            await _mark_agent_replied(sender)
+            logger.info(f"👋 Re-engagement greeting sent to {sender}")
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
-    # Maps link interception — if user sends maps URL, handle completion directly
-    # Dograh's LLM sometimes fails to match edge conditions on maps URLs
-    # This is the reliable fallback: adapter detects it and marks completed
+    # Maps link interception
     maps_keywords = ["maps.app.goo.gl", "maps.google.com", "goo.gl", "https://maps", "maps.app"]
     user_sent_maps = any(kw in user_message.lower() for kw in maps_keywords)
 
@@ -791,34 +859,28 @@ async def whatsapp_webhook(
 
     # If user sent maps but Dograh didn't complete — force completion
     if user_sent_maps and not is_completed:
-        # Check session is active (not already completed)
-        if sessions_collection is not None:
-            cur_session = await sessions_collection.find_one({"phone_number": sender})
-            if cur_session and cur_session.get("lead_status") == "active":
-                logger.info(f"📍 Maps link detected, Dograh didn't complete — forcing completion for {sender}")
-                is_completed = True
+        cur_session = await _get_session(sender)
+        if cur_session and cur_session.get("lead_status") == "active":
+            logger.info(f"📍 Maps link detected, Dograh didn't complete — forcing completion for {sender}")
+            is_completed = True
 
-    # Strip [SEND_EXACT]: prefix if Dograh returns it — user should never see this prefix
+    # Strip [SEND_EXACT]: prefix if Dograh returns it
     if assistant_text and assistant_text.startswith("[SEND_EXACT]:"):
         assistant_text = assistant_text[len("[SEND_EXACT]:"):].strip()
 
     # Send greeting only on the very first message ever in this conversation.
-    # We check the total number of agent messages in the entire chat history —
-    # NOT a time window. This prevents re-greeting mid-conversation if the user
-    # goes quiet for an hour and comes back.
     mapping = await _get_agent_mapping(receiver)
     greeting_sent = False
     if assistant_text and mapping.get("greeting_message"):
         should_greet = False
-        if chats_collection is not None:
-            total_agent_msgs = await chats_collection.count_documents(
-                {"phone_number": sender, "sender": "agent"}
+        if pg_pool is not None:
+            total_agent_msgs = await pg_pool.fetchval(
+                "SELECT COUNT(*) FROM wa_chats WHERE phone_number = $1 AND sender = 'agent'",
+                sender,
             )
             should_greet = total_agent_msgs == 0
-            logger.debug(
-                f"Greeting check: {sender} has {total_agent_msgs} agent msgs total, should_greet={should_greet}")
+            logger.debug(f"Greeting check: {sender} has {total_agent_msgs} agent msgs total, should_greet={should_greet}")
         else:
-            # In-memory fallback — greet if no messages stored at all
             should_greet = len(MESSAGE_STORE.get(sender, [])) == 0
 
         if should_greet and not assistant_text.startswith("Greetings"):
@@ -835,29 +897,15 @@ async def whatsapp_webhook(
 
     # Check if the agent is requesting a human handoff
     if assistant_text and "TRANSFER_TO_HUMAN" in assistant_text:
-        # Strip TRANSFER_TO_HUMAN from the message
         clean_text = assistant_text.replace("TRANSFER_TO_HUMAN", "").strip()
-
-        # Build takeover context for later resume
         takeover_context = (
             f"The user was in the middle of a conversation. "
             f"Last AI message before handoff: {clean_text or 'Pricing/discount discussion'}. "
             f"When AI resumes, continue from where the conversation was — "
             f"do not restart from the beginning."
         )
+        await _update_session_field(sender, pending_handoff=True, takeover_context=takeover_context)
 
-        # Store pending handoff — don't activate yet, ask user first
-        if sessions_collection is not None:
-            await sessions_collection.update_one(
-                {"phone_number": sender},
-                {"$set": {
-                    "pending_handoff": True,
-                    "takeover_context": takeover_context,
-                }},
-                upsert=True,
-            )
-
-        # Ask user for confirmation
         confirm_msg = (
             "I'd like to connect you with our team executive who can assist you better. "
             "Would you like me to transfer you to an executive? (Yes/No)"
@@ -870,59 +918,43 @@ async def whatsapp_webhook(
         resp = MessagingResponse()
         return Response(content=str(resp), media_type="application/xml")
 
-    # Check if user is responding to a pending handoff confirmation
-    if sessions_collection is not None:
-        current_session = await sessions_collection.find_one({"phone_number": sender})
-        if current_session and current_session.get("pending_handoff"):
-            # Check user's response
-            msg_lower = user_message.lower().strip()
-            yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
-            no_words = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
+    # Check if user is responding to a pending handoff confirmation (post-Dograh path)
+    current_session = await _get_session(sender)
+    if current_session and current_session.get("pending_handoff"):
+        msg_lower = user_message.lower().strip()
+        yes_words = ["yes", "yeah", "ok", "okay", "sure", "please", "connect", "transfer", "ya", "yep", "fine"]
+        no_words = ["no", "nope", "nah", "cancel", "don't", "dont", "back", "continue", "proceed"]
+        is_yes = any(w in msg_lower for w in yes_words)
+        is_no  = any(w in msg_lower for w in no_words)
 
-            is_yes = any(w in msg_lower for w in yes_words)
-            is_no  = any(w in msg_lower for w in no_words)
+        if is_yes:
+            takeover_context = current_session.get("takeover_context", "")
+            await _update_session_field(sender, pending_handoff=False)
+            await set_human_takeover(sender, True, takeover_context=takeover_context)
+            confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
+            _send_twilio_reply(sender, confirm_reply, from_number=receiver)
+            await store_message(sender, "agent", confirm_reply, "system")
+            logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
-            if is_yes:
-                # User confirmed — activate human takeover
-                takeover_context = current_session.get("takeover_context", "")
-                await sessions_collection.update_one(
-                    {"phone_number": sender},
-                    {"$set": {"pending_handoff": False}}
-                )
-                await set_human_takeover(sender, True, takeover_context=takeover_context)
-                confirm_reply = "Our executive will be with you shortly. 🙏 Please hold on."
-                _send_twilio_reply(sender, confirm_reply, from_number=receiver)
-                await store_message(sender, "agent", confirm_reply, "system")
-                logger.info(f"✅ User confirmed handoff — human takeover activated for {sender}")
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
+        elif is_no:
+            await _update_session_field(sender, pending_handoff=False, takeover_context="")
+            logger.info(f"❌ User declined handoff — resuming AI flow for {sender}")
 
-            elif is_no:
-                # User declined — clear pending handoff and resume flow
-                await sessions_collection.update_one(
-                    {"phone_number": sender},
-                    {"$set": {"pending_handoff": False}, "$unset": {"takeover_context": ""}}
-                )
-                # Resume from where they were — send back to Dograh
-                logger.info(f"❌ User declined handoff — resuming AI flow for {sender}")
-                # Fall through to normal Dograh call below with original message
-            else:
-                # Unclear response — ask again
-                retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
-                _send_twilio_reply(sender, retry_msg, from_number=receiver)
-                await store_message(sender, "agent", retry_msg, "system")
-                await _mark_agent_replied(sender)
-                resp = MessagingResponse()
-                return Response(content=str(resp), media_type="application/xml")
+        else:
+            retry_msg = "I didn't quite catch that. Would you like to be connected to an executive? Please reply Yes or No."
+            _send_twilio_reply(sender, retry_msg, from_number=receiver)
+            await store_message(sender, "agent", retry_msg, "system")
+            await _mark_agent_replied(sender)
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
     # Send reply via Twilio API
-    # If forced completion from maps link — override Dograh's reply with completion message
     if user_sent_maps and is_completed and assistant_text:
-        # Check if Dograh's reply is NOT the completion message (i.e. wrong reply)
         completion_indicators = ["received your appointment", "confirm your appointment", "reach out to you soon", "take care"]
         is_completion_msg = any(kw in assistant_text.lower() for kw in completion_indicators)
         if not is_completion_msg:
-            # Override with completion message from agent config or default
             completion_msg = mapping.get("completion_message", "") or "We've received your appointment request! We'll confirm your appointment shortly and our executive will reach out to you soon. Take care! 🙏"
             assistant_text = completion_msg
             logger.info(f"📍 Overriding Dograh reply with completion message for {sender}")
@@ -931,21 +963,15 @@ async def whatsapp_webhook(
         _send_twilio_reply(sender, assistant_text, from_number=receiver)
         await store_message(sender, "agent", assistant_text, "ai")
         await _mark_agent_replied(sender)
-        # Consume quota after successful reply
         clean_receiver = receiver.replace("whatsapp:", "").strip()
         await consume_quota(clean_receiver)
 
-        # Use Dograh's is_completed flag ONLY — no keyword detection
-        # Keywords caused false completions when FAQ answers matched completion phrases
         if is_completed:
             await _set_lead_status(sender, "completed")
             if mapping.get("store_leads"):
                 await _store_lead_from_chat(sender)
-            logger.info(
-                f"✅ Lead {sender} marked COMPLETED (is_completed=True)")
+            logger.info(f"✅ Lead {sender} marked COMPLETED (is_completed=True)")
     else:
-        # assistant_text is empty/null
-        # If is_completed=True, workflow ended silently — don't send fallback
         if is_completed:
             await _set_lead_status(sender, "completed")
             if mapping.get("store_leads"):
@@ -960,12 +986,12 @@ async def whatsapp_webhook(
     return Response(content=str(resp), media_type="application/xml")
 
 
-def _split_message(body: str, max_len: int = 1500) -> list[str]:
-    """Split a long message into chunks that fit within WhatsApp's 1600 char limit.
+# ---------------------------------------------------------------------------
+# Twilio helpers
+# ---------------------------------------------------------------------------
 
-    Splits at newlines when possible to keep formatting intact.
-    Uses 1500 as threshold to leave room for any Twilio overhead.
-    """
+def _split_message(body: str, max_len: int = 1500) -> list[str]:
+    """Split a long message into chunks that fit within WhatsApp's 1600 char limit."""
     if len(body) <= max_len:
         return [body]
 
@@ -974,65 +1000,40 @@ def _split_message(body: str, max_len: int = 1500) -> list[str]:
         if len(body) <= max_len:
             chunks.append(body)
             break
-
-        # Find a newline to split at (prefer splitting at paragraph/line boundaries)
         split_idx = body.rfind("\n", 0, max_len)
         if split_idx == -1 or split_idx < max_len // 2:
-            # No good newline — split at last space
             split_idx = body.rfind(" ", 0, max_len)
         if split_idx == -1:
-            # No space either — hard cut
             split_idx = max_len
-
         chunks.append(body[:split_idx].rstrip())
         body = body[split_idx:].lstrip("\n ")
-
     return chunks
 
 
 def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str = "", from_number: str = "") -> None:
-    """Send a WhatsApp message via Twilio API.
-
-    If content_sid is provided, sends as a WhatsApp Template (bypasses 24h window).
-    If media_url is provided, sends image + body as a single message (caption).
-    Otherwise splits long text into chunks.
-    
-    from_number: the agent WhatsApp number to send from (e.g. whatsapp:+17178976546).
-                 If not provided, looked up from the agent config in MongoDB.
-    """
+    """Send a WhatsApp message via Twilio API."""
     if not twilio_client:
         logger.error("Twilio client not configured — cannot send reply")
         return
 
-    # Use the provided from_number (agent's number that received the message)
-    # Fall back to env var only if not provided
     if not from_number:
-        from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+        from_number = f"whatsapp:{os.getenv('TWILIO_WHATSAPP_NUMBER', '')}"
     elif not from_number.startswith("whatsapp:"):
         from_number = f"whatsapp:{from_number}"
 
-    # Template message — bypasses 24h window restriction
+    # Template message
     if content_sid:
         try:
-            msg = twilio_client.messages.create(
-                from_=from_number,
-                to=to,
-                content_sid=content_sid,
-            )
+            msg = twilio_client.messages.create(from_=from_number, to=to, content_sid=content_sid)
             logger.info(f"📋 Template sent to {to} (SID: {msg.sid}, template: {content_sid})")
         except Exception as e:
             logger.error(f"❌ Failed to send template to {to}: {e}")
         return
 
-    # Send image + caption as ONE message
+    # Image + caption
     if media_url:
         try:
-            msg = twilio_client.messages.create(
-                from_=from_number,
-                to=to,
-                media_url=[media_url],
-                body=body,
-            )
+            msg = twilio_client.messages.create(from_=from_number, to=to, media_url=[media_url], body=body)
             logger.info(f"🖼️ Image+caption sent to {to} (SID: {msg.sid})")
         except Exception as e:
             logger.error(f"❌ Failed to send image to {to}: {e}")
@@ -1044,15 +1045,15 @@ def _send_twilio_reply(to: str, body: str, media_url: str = "", content_sid: str
     chunks = _split_message(body)
     for chunk in chunks:
         try:
-            message = twilio_client.messages.create(
-                from_=from_number,
-                to=to,
-                body=chunk,
-            )
+            message = twilio_client.messages.create(from_=from_number, to=to, body=chunk)
             logger.info(f"✅ Reply sent to {to} (SID: {message.sid})")
         except Exception as e:
             logger.error(f"❌ Failed to send reply to {to}: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Dograh API
+# ---------------------------------------------------------------------------
 
 async def _send_to_dograh(
     *,
@@ -1061,26 +1062,13 @@ async def _send_to_dograh(
     session_key: str,
     text: str,
 ) -> dict:
-    """Send a message to Dograh's public text-chat API and return the response.
-
-    Returns dict with keys: assistant_text, is_completed, workflow_run_id.
-    """
+    """Send a message to Dograh's public text-chat API and return the response."""
     url = f"{DOGRAH_API_BASE}/public/agent/text-chat/test/workflow/{trigger_path}/message"
-
-    payload = {
-        "session_key": session_key,
-        "text": text,
-    }
-
-    headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json",
-    }
-
+    payload = {"session_key": session_key, "text": text}
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload, headers=headers)
-
         if response.status_code == 200:
             data = response.json()
             assistant_text = data.get("assistant_text")
@@ -1091,17 +1079,10 @@ async def _send_to_dograh(
                 f"{assistant_text[:80] if assistant_text else '(empty)'}"
                 f"{' [COMPLETED]' if is_completed else ''}"
             )
-            return {
-                "assistant_text": assistant_text,
-                "is_completed": is_completed,
-                "workflow_run_id": workflow_run_id,
-            }
+            return {"assistant_text": assistant_text, "is_completed": is_completed, "workflow_run_id": workflow_run_id}
         else:
-            logger.error(
-                f"Dograh API error {response.status_code}: {response.text[:200]}"
-            )
+            logger.error(f"Dograh API error {response.status_code}: {response.text[:200]}")
             return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
-
     except httpx.TimeoutException:
         logger.error(f"Dograh API timeout for session {session_key}")
         return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
@@ -1110,27 +1091,14 @@ async def _send_to_dograh(
         return {"assistant_text": None, "is_completed": False, "workflow_run_id": None}
 
 
+# ---------------------------------------------------------------------------
+# AgentX internal credits API
+# ---------------------------------------------------------------------------
+
 async def _agentx_internal(
     method: str, path: str, payload: dict | None = None
 ) -> dict:
-    """Call AgentX's internal credits API, authenticating with the shared secret.
-
-    The browser never holds DOGRAH_INTERNAL_SECRET (R7.10): the dashboard talks
-    to this adapter, and only the adapter forwards the secret to AgentX over the
-    internal Docker network (http://api:8000 by default).
-
-    Args:
-        method: HTTP verb ("GET", "POST")
-        path: path under /internal/credits (e.g. "/resolve-account")
-        payload: JSON body for POST requests
-
-    Returns:
-        The parsed JSON response.
-
-    Raises:
-        HTTPException: with AgentX's status code if it returns >= 400. The secret
-            is never included in the raised detail.
-    """
+    """Call AgentX's internal credits API, authenticating with the shared secret."""
     url = f"{AGENTX_INTERNAL_BASE}/internal/credits{path}"
     headers = {
         "X-Dograh-Internal-Secret": DOGRAH_INTERNAL_SECRET,
@@ -1138,16 +1106,17 @@ async def _agentx_internal(
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.request(method, url, json=payload, headers=headers)
-
     if response.status_code >= 400:
-        # Surface AgentX's status but truncate the body and never echo the secret.
         raise HTTPException(
             status_code=response.status_code,
             detail=f"AgentX credits API error: {response.text[:300]}",
         )
-
     return response.json()
 
+
+# ---------------------------------------------------------------------------
+# Quota
+# ---------------------------------------------------------------------------
 
 async def check_quota(agent_doc: dict) -> tuple[bool, str]:
     """Check if agent has quota remaining. Returns (allowed, reason)."""
@@ -1162,21 +1131,21 @@ async def check_quota(agent_doc: dict) -> tuple[bool, str]:
 
 async def consume_quota(phone_number: str) -> None:
     """Increment quota_used for the agent after a successful message."""
-    if agents_collection is None:
+    if pg_pool is None:
         return
-    await agents_collection.update_one(
-        {"phone_number": phone_number},
-        {"$inc": {"quota_used": 1}},
+    row = await pg_pool.fetchrow(
+        """UPDATE wa_agents SET quota_used = quota_used + 1
+           WHERE phone_number = $1
+           RETURNING quota_used, quota_limit, quota_enabled, agent_name""",
+        phone_number,
     )
-    # Log current usage
-    doc = await agents_collection.find_one({"phone_number": phone_number})
-    if doc and doc.get("quota_enabled"):
-        used = doc.get("quota_used", 0)
-        limit = doc.get("quota_limit", 500)
-        logger.debug(f"💳 Quota: {used}/{limit} msgs used for '{doc.get('agent_name')}'")
+    if row and row["quota_enabled"]:
+        logger.debug(f"💳 Quota: {row['quota_used']}/{row['quota_limit']} msgs used for '{row['agent_name']}'")
 
 
-
+# ---------------------------------------------------------------------------
+# Follow-up scheduler
+# ---------------------------------------------------------------------------
 
 FOLLOWUP_PROMPTS = [
     "[SYSTEM: The user has not replied for a while. Send a gentle follow-up based on where the conversation left off. If you were waiting for their name, ask for it again. If waiting for location, remind them. If waiting for confirmation, ask again. Keep it short, friendly, 1-2 lines. Don't repeat your exact last message — rephrase it.]",
@@ -1186,10 +1155,7 @@ FOLLOWUP_PROMPTS = [
 
 
 async def _followup_loop() -> None:
-    """Background loop: checks for idle sessions and sends follow-ups.
-
-    Runs every 60s. Only fires for agents with followups_enabled=true.
-    """
+    """Background loop: checks for idle sessions and sends follow-ups."""
     logger.info("🔄 Follow-up scheduler started.")
     while True:
         await asyncio.sleep(60)
@@ -1203,13 +1169,13 @@ async def _process_followups() -> None:
     """Scan sessions and send follow-ups where due."""
     now = datetime.now(timezone.utc)
 
-    # Load enabled agents from MongoDB agents collection
-    if agents_collection is not None:
-        agent_docs = await agents_collection.find(
-            {"followups_enabled": True, "is_active": True}
-        ).to_list(length=100)
+    # Load enabled agents
+    if pg_pool is not None:
+        rows = await pg_pool.fetch(
+            "SELECT * FROM wa_agents WHERE followups_enabled = true AND is_active = true"
+        )
+        agent_docs = [_row_to_dict(r) for r in rows]
     else:
-        # In-memory fallback: use AGENT_MAPPINGS
         agent_docs = [
             {**v, "phone_number": k}
             for k, v in AGENT_MAPPINGS.items()
@@ -1222,29 +1188,19 @@ async def _process_followups() -> None:
     followup_agents = {doc["phone_number"] for doc in agent_docs}
     agent_map = {doc["phone_number"]: doc for doc in agent_docs}
 
-    # Query sessions that are active and have an agent_number in followup_agents
-    if sessions_collection is not None:
-        query = {
-            "lead_status": {"$in": ["active", None]},
-            "human_takeover": {"$ne": True},
-            "agent_number": {"$regex": "|".join(
-                a.replace("+", "\\+") for a in followup_agents
-            )},
-        }
-        sessions = await sessions_collection.find(query).to_list(length=500)
-        no_status_query = {
-            "lead_status": {"$exists": False},
-            "human_takeover": {"$ne": True},
-            "agent_number": {"$regex": "|".join(
-                a.replace("+", "\\+") for a in followup_agents
-            )},
-        }
-        no_status_sessions = await sessions_collection.find(no_status_query).to_list(length=500)
-        seen = {s["phone_number"] for s in sessions}
-        for s in no_status_sessions:
-            if s["phone_number"] not in seen:
-                sessions.append(s)
-                seen.add(s["phone_number"])
+    # Query eligible sessions
+    if pg_pool is not None:
+        # Build a WHERE clause that matches agent_number containing any of the followup agent numbers
+        agent_patterns = [f"%{a}%" for a in followup_agents]
+        placeholders = " OR ".join(f"agent_number LIKE ${i+1}" for i in range(len(agent_patterns)))
+        query = f"""
+            SELECT * FROM wa_sessions
+            WHERE (lead_status IN ('active') OR lead_status IS NULL)
+              AND (human_takeover = false OR human_takeover IS NULL)
+              AND ({placeholders})
+        """
+        sessions_rows = await pg_pool.fetch(query, *agent_patterns)
+        sessions = [_row_to_dict(r) for r in sessions_rows]
     else:
         sessions = [
             s for s in SESSIONS_STORE.values()
@@ -1253,15 +1209,13 @@ async def _process_followups() -> None:
             and any(a in s.get("agent_number", "") for a in followup_agents)
         ]
 
-    logger.debug(
-        f"🔍 Follow-up scan: found {len(sessions)} eligible session(s)")
+    logger.debug(f"🔍 Follow-up scan: found {len(sessions)} eligible session(s)")
 
     for session in sessions:
         phone_number = session["phone_number"]
         agent_number = session.get("agent_number", "")
         stage = session.get("followup_stage", 0)
-        last_reply = session.get(
-            "last_agent_reply_at") or session.get("last_activity")
+        last_reply = session.get("last_agent_reply_at") or session.get("last_activity")
 
         if not last_reply or stage >= len(FOLLOWUP_PROMPTS):
             continue
@@ -1276,34 +1230,32 @@ async def _process_followups() -> None:
                 continue
 
         delays = mapping.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS)
+        if isinstance(delays, str):
+            delays = json.loads(delays)
 
         if stage >= len(delays):
             continue
 
         # Check if enough time has passed since last agent reply
         if isinstance(last_reply, str):
-            last_reply = datetime.fromisoformat(
-                last_reply.replace("Z", "+00:00"))
+            last_reply = datetime.fromisoformat(last_reply.replace("Z", "+00:00"))
         if last_reply.tzinfo is None:
             last_reply = last_reply.replace(tzinfo=timezone.utc)
 
         elapsed = (now - last_reply).total_seconds()
 
-        # Skip truly stale sessions (idle > 7 days) — definitely abandoned
+        # Skip truly stale sessions (idle > 7 days)
         if elapsed > 86400 * 7:
             continue
         if elapsed < delays[stage]:
             continue
 
         # Skip if lead already completed/inactive/not_qualified
-        current_session = None
-        if sessions_collection is not None:
-            current_session = await sessions_collection.find_one({"phone_number": phone_number})
+        current_session = await _get_session(phone_number)
         if current_session and current_session.get("lead_status") in ["completed", "inactive", "not_qualified"]:
             logger.debug(f"⏭️ Skipping follow-up for {phone_number} — lead_status={current_session.get('lead_status')}")
             continue
 
-        # Time to send follow-up
         logger.info(
             f"⏰ Follow-up {stage + 1} for {phone_number} "
             f"(idle {int(elapsed)}s, threshold {delays[stage]}s)"
@@ -1315,17 +1267,15 @@ async def _process_followups() -> None:
         except KeyError:
             continue
 
-        # Get follow-up config for this stage
-        # followup_messages is list of {message: str, template_sid: str}
-        # Supports legacy list[str] format for backwards compatibility
         followup_messages = mapping.get("followup_messages", [])
+        if isinstance(followup_messages, str):
+            followup_messages = json.loads(followup_messages)
         followup_item: dict = {}
         if stage < len(followup_messages):
             item = followup_messages[stage]
             if isinstance(item, dict):
                 followup_item = item
             elif isinstance(item, str):
-                # Legacy format — treat as custom message
                 followup_item = {"message": item, "template_sid": ""}
 
         custom_text  = (followup_item.get("message") or "").strip()
@@ -1333,38 +1283,31 @@ async def _process_followups() -> None:
         is_over_24h  = delays[stage] >= 86400
 
         if is_over_24h:
-            # ≥ 24h — template REQUIRED
             if not template_sid:
                 logger.warning(
                     f"⏭️ Skipping follow-up {stage + 1} for {phone_number} — "
-                    f"delay ≥24h ({delays[stage]}s) but no template_sid set. "
-                    f"Add a Twilio Content SID in the dashboard."
+                    f"delay ≥24h ({delays[stage]}s) but no template_sid set."
                 )
-                # Still increment stage so we don't retry this one forever
                 await _increment_followup(phone_number, stage + 1)
                 continue
-            # Send via Twilio template
             logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (delay={delays[stage]}s ≥24h)")
             _send_twilio_reply(phone_number, "", content_sid=template_sid, from_number=agent_number)
             await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
             await _mark_agent_replied(phone_number)
 
         elif template_sid:
-            # < 24h, template optionally set — use it
             logger.info(f"📋 Using template follow-up {stage + 1} for {phone_number} (optional, <24h)")
             _send_twilio_reply(phone_number, "", content_sid=template_sid, from_number=agent_number)
             await store_message(phone_number, "agent", f"[Template: {template_sid}]", "followup")
             await _mark_agent_replied(phone_number)
 
         elif custom_text:
-            # < 24h, custom text — send directly, skip Dograh
             logger.info(f"📝 Using custom follow-up {stage + 1} for {phone_number}")
             _send_twilio_reply(phone_number, custom_text, from_number=agent_number)
             await store_message(phone_number, "agent", custom_text, "followup")
             await _mark_agent_replied(phone_number)
 
         else:
-            # < 24h, AI generated through Dograh
             dograh_response = await _send_to_dograh(
                 api_key=api_key,
                 trigger_path=trigger_path,
@@ -1382,11 +1325,9 @@ async def _process_followups() -> None:
         new_stage = stage + 1
         await _increment_followup(phone_number, new_stage)
 
-        # If all follow-ups exhausted, mark inactive
         if new_stage >= len(FOLLOWUP_PROMPTS):
             await _set_lead_status(phone_number, "inactive")
-            logger.info(
-                f"💤 Lead {phone_number} marked INACTIVE after {new_stage} follow-ups")
+            logger.info(f"💤 Lead {phone_number} marked INACTIVE after {new_stage} follow-ups")
 
 
 # ---------------------------------------------------------------------------
@@ -1396,33 +1337,39 @@ async def _process_followups() -> None:
 
 @app.get("/conversations")
 async def get_conversations(agent_number: str = "", _auth: bool = Depends(require_operator)):
-    """Get all conversations for the dashboard (cached 30s). Optionally filter by agent_number."""
-    now = time.monotonic()
+    """Get all conversations for the dashboard (cached 30s)."""
+    now_mono = time.monotonic()
     cache_key = agent_number or "all"
-    if CONVERSATIONS_CACHE.get(cache_key) and now < CONVERSATIONS_CACHE.get(f"{cache_key}_expires", 0):
+    if CONVERSATIONS_CACHE.get(cache_key) and now_mono < CONVERSATIONS_CACHE.get(f"{cache_key}_expires", 0):
         return CONVERSATIONS_CACHE[cache_key]
 
     conversations = []
 
-    if sessions_collection is not None:
-        query: dict = {}
+    if pg_pool is not None:
         if agent_number:
             clean = agent_number.replace("whatsapp:", "").strip()
-            query["agent_number"] = {"$in": [clean, f"whatsapp:{clean}"]}
+            sessions_rows = await pg_pool.fetch(
+                "SELECT * FROM wa_sessions WHERE agent_number LIKE $1 OR agent_number LIKE $2",
+                clean, f"whatsapp:{clean}",
+            )
+        else:
+            sessions_rows = await pg_pool.fetch("SELECT * FROM wa_sessions")
 
-        async for session in sessions_collection.find(query):
-            phone_number = session["phone_number"]
-            last_chat = await chats_collection.find_one(
-                {"phone_number": phone_number}, sort=[("timestamp", -1)]
+        for row in sessions_rows:
+            phone_number = row["phone_number"]
+            last_chat = await pg_pool.fetchrow(
+                "SELECT content, timestamp FROM wa_chats WHERE phone_number = $1 ORDER BY timestamp DESC LIMIT 1",
+                phone_number,
             )
             timestamp_str = ""
-            if last_chat and last_chat.get("timestamp"):
-                timestamp_str = last_chat["timestamp"].isoformat() + "Z"
+            if last_chat and last_chat["timestamp"]:
+                ts = last_chat["timestamp"]
+                timestamp_str = ts.isoformat() + ("Z" if ts.tzinfo is None else "").replace("+00:00", "Z")
             conversations.append({
                 "phone_number": phone_number,
-                "agent_number": session.get("agent_number", "").replace("whatsapp:", ""),
-                "human_takeover": session.get("human_takeover", False),
-                "lead_status": session.get("lead_status", "active"),
+                "agent_number": (row.get("agent_number") or "").replace("whatsapp:", ""),
+                "human_takeover": row.get("human_takeover", False),
+                "lead_status": row.get("lead_status", "active"),
                 "last_message": last_chat["content"] if last_chat else "",
                 "last_message_time": timestamp_str,
             })
@@ -1444,11 +1391,9 @@ async def get_conversations(agent_number: str = "", _auth: bool = Depends(requir
                 "last_message_time": last_msg["timestamp"] if last_msg else "",
             })
 
-    # Sort newest first
     conversations.sort(key=lambda x: x.get("last_message_time", ""), reverse=True)
-
     CONVERSATIONS_CACHE[cache_key] = conversations
-    CONVERSATIONS_CACHE[f"{cache_key}_expires"] = now + 30
+    CONVERSATIONS_CACHE[f"{cache_key}_expires"] = now_mono + 30
     return conversations
 
 
@@ -1456,20 +1401,19 @@ async def get_conversations(agent_number: str = "", _auth: bool = Depends(requir
 async def get_messages(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get all messages for a specific conversation."""
     phone_number = phone_number.replace("%3A", ":")
-
-    if chats_collection is not None:
-        cursor = chats_collection.find({"phone_number": phone_number}).sort(
-            "timestamp", 1
+    if pg_pool is not None:
+        rows = await pg_pool.fetch(
+            "SELECT sender, content, type, timestamp FROM wa_chats WHERE phone_number = $1 ORDER BY timestamp ASC",
+            phone_number,
         )
-        messages = await cursor.to_list(length=None)
         return [
             {
-                "sender": msg["sender"],
-                "content": msg["content"],
-                "timestamp": msg["timestamp"].isoformat() + "Z",
-                "type": msg["type"],
+                "sender": r["sender"],
+                "content": r["content"],
+                "timestamp": r["timestamp"].isoformat() + "Z" if r["timestamp"] else "",
+                "type": r["type"],
             }
-            for msg in messages
+            for r in rows
         ]
     else:
         return MESSAGE_STORE.get(phone_number, [])
@@ -1480,57 +1424,40 @@ async def takeover_conversation(request: Request, _auth: bool = Depends(require_
     """Human agent takes over a conversation (AI stops responding)."""
     data = await request.json()
     phone_number = data.get("phone_number")
-
     if not phone_number:
         raise HTTPException(status_code=400, detail="phone_number is required")
 
     await set_human_takeover(phone_number, True)
     logger.info(f"🧑 Human takeover activated for {phone_number}")
-
-    await store_message(
-        phone_number, "agent", "A human agent has joined the conversation.", "system"
-    )
-
+    await store_message(phone_number, "agent", "A human agent has joined the conversation.", "system")
     return {"success": True, "message": "Takeover successful"}
 
 
 @app.post("/release")
 async def release_conversation(request: Request, _auth: bool = Depends(require_operator)):
-    """Release conversation back to AI.
-    
-    After human releases, sends a resume context message to Dograh so the AI
-    knows where to pick up the conversation — not from the beginning.
-    """
+    """Release conversation back to AI."""
     data = await request.json()
     phone_number = data.get("phone_number")
-
     if not phone_number:
         raise HTTPException(status_code=400, detail="phone_number is required")
 
     # Fetch stored takeover context before clearing
     takeover_context = ""
-    if sessions_collection is not None:
-        session = await sessions_collection.find_one({"phone_number": phone_number})
-        if session:
-            takeover_context = session.get("takeover_context", "")
+    session = await _get_session(phone_number)
+    if session:
+        takeover_context = session.get("takeover_context", "")
 
     await set_human_takeover(phone_number, False)
     logger.info(f"🤖 AI mode restored for {phone_number}")
-
-    await store_message(
-        phone_number, "agent", "Conversation returned to AI.", "system"
-    )
+    await store_message(phone_number, "agent", "Conversation returned to AI.", "system")
 
     # Send resume context to Dograh so AI picks up from the right step
     if takeover_context:
         try:
-            # Get agent config for this phone
-            # Find agent_number from session
             agent_number = ""
-            if sessions_collection is not None:
-                session = await sessions_collection.find_one({"phone_number": phone_number})
-                if session:
-                    agent_number = session.get("agent_number", "").replace("whatsapp:", "")
+            session = await _get_session(phone_number)
+            if session:
+                agent_number = (session.get("agent_number") or "").replace("whatsapp:", "")
 
             if agent_number:
                 agent_doc = await _get_agent_doc(f"whatsapp:{agent_number}")
@@ -1553,7 +1480,6 @@ async def release_conversation(request: Request, _auth: bool = Depends(require_o
                         text=resume_prompt,
                     )
                     resume_text = resume_response.get("assistant_text", "")
-                    # Strip [SEND_EXACT]: prefix if present
                     if resume_text and resume_text.startswith("[SEND_EXACT]:"):
                         resume_text = resume_text[len("[SEND_EXACT]:"):].strip()
                     if resume_text and "TRANSFER_TO_HUMAN" not in resume_text:
@@ -1563,11 +1489,7 @@ async def release_conversation(request: Request, _auth: bool = Depends(require_o
                         logger.info(f"🔄 AI resumed for {phone_number}: {resume_text[:60]}")
 
             # Clear takeover context after using it
-            if sessions_collection is not None:
-                await sessions_collection.update_one(
-                    {"phone_number": phone_number},
-                    {"$unset": {"takeover_context": ""}}
-                )
+            await _update_session_field(phone_number, takeover_context="")
         except Exception as e:
             logger.warning(f"Failed to send resume context to Dograh: {e}")
 
@@ -1582,37 +1504,40 @@ async def receive_lead_data(request: Request):
 
     gathered = data.get("gathered_context", {})
     initial = data.get("initial_context", {})
-
     phone_number = initial.get("phone_number", "")
 
-    # Resolve agent_number from sessions collection using the user's phone number
+    # Resolve agent_number from sessions
     agent_number = ""
-    if phone_number and sessions_collection is not None:
-        session = await sessions_collection.find_one({
-            "phone_number": {"$in": [phone_number, f"whatsapp:{phone_number}"]}
-        })
-        if session:
-            agent_number = session.get("agent_number", "").replace("whatsapp:", "")
+    if phone_number and pg_pool is not None:
+        row = await pg_pool.fetchrow(
+            "SELECT agent_number FROM wa_sessions WHERE phone_number = $1 OR phone_number = $2",
+            phone_number, f"whatsapp:{phone_number}",
+        )
+        if row:
+            agent_number = (row["agent_number"] or "").replace("whatsapp:", "")
 
-    lead_doc = {
-        "patient_name": gathered.get("patient_name", ""),
-        "concern": gathered.get("concern", ""),
-        "city": gathered.get("city", ""),
-        "locality": gathered.get("locality", ""),
-        "user_location": gathered.get("user_location", ""),
-        "notes": gathered.get("notes", ""),
-        "phone_number": phone_number,
-        "agent_number": agent_number,
-        "workflow_run_id": data.get("workflow_run_id", ""),
-        "created_at": datetime.now(timezone.utc),
-    }
+    now = datetime.now(timezone.utc)
 
-    if db is not None:
-        leads_collection = db["leads"]
-        await leads_collection.insert_one(lead_doc)
-        logger.info(f"💾 Lead stored: {lead_doc['patient_name']} - {lead_doc['concern']} - agent: {agent_number}")
+    if pg_pool is not None:
+        await pg_pool.execute(
+            """INSERT INTO wa_leads (
+                phone_number, agent_number, patient_name, concern, city, locality,
+                user_location, notes, workflow_run_id, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+            phone_number,
+            agent_number,
+            gathered.get("patient_name", ""),
+            gathered.get("concern", ""),
+            gathered.get("city", ""),
+            gathered.get("locality", ""),
+            gathered.get("user_location", ""),
+            gathered.get("notes", ""),
+            str(data.get("workflow_run_id", "")),
+            now,
+        )
+        logger.info(f"💾 Lead stored: {gathered.get('patient_name', '')} - {gathered.get('concern', '')} - agent: {agent_number}")
     else:
-        logger.warning("MongoDB unavailable — lead data not stored")
+        logger.warning("PostgreSQL unavailable — lead data not stored")
 
     return {"success": True}
 
@@ -1623,52 +1548,34 @@ async def send_message(request: Request, _auth: bool = Depends(require_operator)
     data = await request.json()
     phone_number = data.get("phone_number")
     message = data.get("message")
-
     if not phone_number or not message:
-        raise HTTPException(
-            status_code=400, detail="phone_number and message are required"
-        )
+        raise HTTPException(status_code=400, detail="phone_number and message are required")
 
-    # Check if human has taken over
     if not await get_human_takeover_status(phone_number):
-        raise HTTPException(
-            status_code=403, detail="Must take over conversation first"
-        )
+        raise HTTPException(status_code=403, detail="Must take over conversation first")
 
-    # Send via Twilio
     if not twilio_client:
-        raise HTTPException(
-            status_code=500, detail="Twilio client not configured")
+        raise HTTPException(status_code=500, detail="Twilio client not configured")
 
-    # Look up which agent number owns this conversation from MongoDB
+    # Look up which agent number owns this conversation
     agent_number = None
-    if sessions_collection is not None:
-        session = await sessions_collection.find_one(
-            {"phone_number": phone_number},
-            {"agent_number": 1}
-        )
-        if session:
-            agent_number = session.get("agent_number")
+    session = await _get_session(phone_number)
+    if session:
+        agent_number = session.get("agent_number")
     if not agent_number:
         raise HTTPException(
             status_code=500,
-            detail=f"No agent number found for conversation with {phone_number}. Cannot determine which Twilio number to send from."
+            detail=f"No agent number found for conversation with {phone_number}.",
         )
-    from_number = f"whatsapp:{agent_number}"
+    from_number = f"whatsapp:{agent_number}" if not agent_number.startswith("whatsapp:") else agent_number
     try:
-        twilio_message = twilio_client.messages.create(
-            from_=from_number,
-            to=phone_number,
-            body=message,
-        )
+        twilio_message = twilio_client.messages.create(from_=from_number, to=phone_number, body=message)
         await store_message(phone_number, "agent", message, "human")
         logger.info(f"✅ Human agent sent message to {phone_number}")
         return {"success": True, "message": "Message sent", "sid": twilio_message.sid}
-
     except Exception as e:
         error_str = str(e)
         logger.error(f"❌ Error sending message: {error_str}")
-
         if "63016" in error_str:
             return {
                 "success": False,
@@ -1685,7 +1592,6 @@ async def send_message(request: Request, _auth: bool = Depends(require_operator)
 
 def _make_agent_prefix(agent_name: str) -> str:
     """Generate collection prefix from agent name."""
-    import re
     prefix = agent_name.lower().strip()
     prefix = re.sub(r"[^a-z0-9]+", "_", prefix)
     prefix = prefix.strip("_")
@@ -1693,40 +1599,41 @@ def _make_agent_prefix(agent_name: str) -> str:
 
 
 def _serialize_agent(doc: dict) -> dict:
-    """Serialize an agent document for JSON response (remove MongoDB _id, mask API key)."""
+    """Serialize an agent dict for JSON response (mask API key)."""
     doc = dict(doc)
-    doc.pop("_id", None)
-    if doc.get("created_at"):
-        doc["created_at"] = doc["created_at"].isoformat() + "Z"
-    if doc.get("updated_at"):
-        doc["updated_at"] = doc["updated_at"].isoformat() + "Z"
-    
-    # Mask API key (Task 1.5): show first 8 + last 4 chars
+    doc.pop("id", None)
+    for key in ("created_at", "updated_at"):
+        val = doc.get(key)
+        if isinstance(val, datetime):
+            doc[key] = val.isoformat() + "Z" if val.tzinfo is None else val.isoformat().replace("+00:00", "Z")
+    # Mask API key: show first 8 + last 4 chars
     if doc.get("api_key"):
         key = doc["api_key"]
         if len(key) > 12:
             doc["api_key"] = f"{key[:8]}...{key[-4:]}"
         else:
-            # Too short to mask — hide completely
             doc["api_key"] = "***"
-    
+    # Ensure JSONB fields are serializable
+    for jf in ("followup_delays", "followup_messages"):
+        if isinstance(doc.get(jf), str):
+            doc[jf] = json.loads(doc[jf])
     return doc
 
 
 @app.get("/agents")
 async def list_agents(_auth: bool = Depends(require_operator)):
     """List all agents."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-    docs = await agents_collection.find({}).to_list(length=200)
-    return [_serialize_agent(d) for d in docs]
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    rows = await pg_pool.fetch("SELECT * FROM wa_agents ORDER BY created_at DESC")
+    return [_serialize_agent(_row_to_dict(r)) for r in rows]
 
 
 @app.post("/agents")
 async def create_agent(request: Request, _auth: bool = Depends(require_operator)):
     """Create a new agent."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     data = await request.json()
 
     phone_number = data.get("phone_number", "").strip()
@@ -1734,56 +1641,59 @@ async def create_agent(request: Request, _auth: bool = Depends(require_operator)
     if not phone_number or not agent_name:
         raise HTTPException(status_code=400, detail="phone_number and agent_name are required")
 
-    existing = await agents_collection.find_one({"phone_number": phone_number})
+    existing = await pg_pool.fetchrow(
+        "SELECT id FROM wa_agents WHERE phone_number = $1", phone_number
+    )
     if existing:
         raise HTTPException(status_code=409, detail=f"Agent with number {phone_number} already exists")
 
     collection_prefix = data.get("collection_prefix") or _make_agent_prefix(agent_name)
+    now = datetime.now(timezone.utc)
 
-    doc = {
-        "phone_number": phone_number,
-        "agent_name": agent_name,
-        "collection_prefix": collection_prefix,
-        "api_key": data.get("api_key", ""),
-        "trigger_path": data.get("trigger_path", ""),
-        "followups_enabled": data.get("followups_enabled", False),
-        "followup_delays": data.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS),
-        "followup_messages": data.get("followup_messages", []),
-        "greeting_message": data.get("greeting_message", ""),
-        "greeting_image_url": data.get("greeting_image_url", ""),
-        "greeting_window_hours": data.get("greeting_window_hours", 12),
-        "completion_message": data.get("completion_message", ""),
-        "store_leads": data.get("store_leads", False),
-        "quota_enabled": data.get("quota_enabled", False),
-        "quota_limit": data.get("quota_limit", 500),
-        "quota_used": 0,
-        "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "is_active": data.get("is_active", True),
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-    }
-    await agents_collection.insert_one(doc)
+    row = await pg_pool.fetchrow(
+        """INSERT INTO wa_agents (
+            phone_number, agent_name, collection_prefix, api_key, trigger_path,
+            followups_enabled, followup_delays, followup_messages,
+            greeting_message, greeting_image_url, greeting_window_hours,
+            completion_message, store_leads, quota_enabled, quota_limit,
+            quota_used, quota_reset_date, is_active, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,0,$16,$17,$18,$19)
+        RETURNING *""",
+        phone_number, agent_name, collection_prefix,
+        data.get("api_key", ""), data.get("trigger_path", ""),
+        data.get("followups_enabled", False),
+        json.dumps(data.get("followup_delays", DEFAULT_FOLLOWUP_DELAYS)),
+        json.dumps(data.get("followup_messages", [])),
+        data.get("greeting_message", ""), data.get("greeting_image_url", ""),
+        data.get("greeting_window_hours", 12),
+        data.get("completion_message", ""),
+        data.get("store_leads", False), data.get("quota_enabled", False),
+        data.get("quota_limit", 500),
+        now.strftime("%Y-%m-%d"),
+        data.get("is_active", True),
+        now, now,
+    )
     logger.info(f"✅ Agent created: {agent_name} ({phone_number})")
-    return _serialize_agent(doc)
+    return _serialize_agent(_row_to_dict(row))
 
 
 @app.get("/agents/{phone_number:path}")
 async def get_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get a single agent by phone number."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     phone_number = phone_number.replace("%2B", "+").strip()
-    doc = await agents_collection.find_one({"phone_number": phone_number})
-    if not doc:
+    row = await pg_pool.fetchrow("SELECT * FROM wa_agents WHERE phone_number = $1", phone_number)
+    if not row:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return _serialize_agent(doc)
+    return _serialize_agent(_row_to_dict(row))
 
 
 @app.put("/agents/{phone_number:path}")
 async def update_agent(phone_number: str, request: Request, _auth: bool = Depends(require_operator)):
     """Update an agent's config."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     phone_number = phone_number.replace("%2B", "+").strip()
     data = await request.json()
 
@@ -1798,7 +1708,7 @@ async def update_agent(phone_number: str, request: Request, _auth: bool = Depend
     if not update:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    # Sanitize strings — remove surrogate characters that break MongoDB UTF-8 encoding
+    # Sanitize strings
     def _sanitize(obj):
         if isinstance(obj, str):
             return obj.encode("utf-8", errors="replace").decode("utf-8")
@@ -1807,30 +1717,43 @@ async def update_agent(phone_number: str, request: Request, _auth: bool = Depend
         if isinstance(obj, dict):
             return {k: _sanitize(v) for k, v in obj.items()}
         return obj
-
     update = _sanitize(update)
-
     update["updated_at"] = datetime.now(timezone.utc)
-    result = await agents_collection.update_one(
-        {"phone_number": phone_number},
-        {"$set": update},
+
+    # Build dynamic UPDATE
+    sets = []
+    vals = [phone_number]
+    idx = 2
+    jsonb_fields = {"followup_delays", "followup_messages"}
+    for k, v in update.items():
+        if k in jsonb_fields:
+            sets.append(f"{k} = ${idx}::jsonb")
+            vals.append(json.dumps(v))
+        else:
+            sets.append(f"{k} = ${idx}")
+            vals.append(v)
+        idx += 1
+
+    result = await pg_pool.execute(
+        f"UPDATE wa_agents SET {', '.join(sets)} WHERE phone_number = $1",
+        *vals,
     )
-    if result.matched_count == 0:
+    if "UPDATE 0" in result:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    doc = await agents_collection.find_one({"phone_number": phone_number})
+    row = await pg_pool.fetchrow("SELECT * FROM wa_agents WHERE phone_number = $1", phone_number)
     logger.info(f"✅ Agent updated: {phone_number} — fields: {list(update.keys())}")
-    return _serialize_agent(doc)
+    return _serialize_agent(_row_to_dict(row))
 
 
 @app.delete("/agents/{phone_number:path}")
 async def delete_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Delete an agent."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     phone_number = phone_number.replace("%2B", "+").strip()
-    result = await agents_collection.delete_one({"phone_number": phone_number})
-    if result.deleted_count == 0:
+    result = await pg_pool.execute("DELETE FROM wa_agents WHERE phone_number = $1", phone_number)
+    if "DELETE 0" in result:
         raise HTTPException(status_code=404, detail="Agent not found")
     logger.info(f"🗑️ Agent deleted: {phone_number}")
     return {"success": True, "message": f"Agent {phone_number} deleted"}
@@ -1838,19 +1761,19 @@ async def delete_agent(phone_number: str, _auth: bool = Depends(require_operator
 
 @app.post("/agents/{phone_number:path}/reset-quota")
 async def reset_agent_quota(phone_number: str, _auth: bool = Depends(require_operator)):
-    """Reset quota_used to 0 for an agent (e.g. after payment/renewal)."""
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    """Reset quota_used to 0 for an agent."""
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     phone_number = phone_number.replace("%2B", "+").strip()
-    result = await agents_collection.update_one(
-        {"phone_number": phone_number},
-        {"$set": {
-            "quota_used": 0,
-            "quota_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "updated_at": datetime.now(timezone.utc),
-        }},
+    result = await pg_pool.execute(
+        """UPDATE wa_agents SET quota_used = 0,
+           quota_reset_date = $2, updated_at = $3
+           WHERE phone_number = $1""",
+        phone_number,
+        datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        datetime.now(timezone.utc),
     )
-    if result.matched_count == 0:
+    if "UPDATE 0" in result:
         raise HTTPException(status_code=404, detail="Agent not found")
     logger.info(f"🔄 Quota reset for {phone_number}")
     return {"success": True, "message": f"Quota reset for {phone_number}"}
@@ -1862,23 +1785,31 @@ async def reset_agent_quota(phone_number: str, _auth: bool = Depends(require_ope
 
 @app.get("/leads")
 async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = "", _auth: bool = Depends(require_operator)):
-    """Get all captured leads, newest first. Optionally filter by agent_number."""
-    if db is None:
+    """Get all captured leads, newest first."""
+    if pg_pool is None:
         return []
-    leads_collection = db["leads"]
-    query: dict = {}
+
     if agent_number:
         clean = agent_number.replace("whatsapp:", "").strip()
-        # Match exact number OR whatsapp-prefixed OR empty (legacy leads without agent_number)
-        query["agent_number"] = {"$in": [clean, f"whatsapp:{clean}"]}
-    cursor = leads_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    leads = await cursor.to_list(length=limit)
+        rows = await pg_pool.fetch(
+            """SELECT * FROM wa_leads
+               WHERE agent_number = $1 OR agent_number = $2
+               ORDER BY created_at DESC OFFSET $3 LIMIT $4""",
+            clean, f"whatsapp:{clean}", skip, limit,
+        )
+    else:
+        rows = await pg_pool.fetch(
+            "SELECT * FROM wa_leads ORDER BY created_at DESC OFFSET $1 LIMIT $2",
+            skip, limit,
+        )
+
     result = []
-    for lead in leads:
-        lead.pop("_id", None)
-        if lead.get("created_at"):
-            lead["created_at"] = lead["created_at"].isoformat() + "Z"
-        result.append(lead)
+    for row in rows:
+        d = _row_to_dict(row)
+        d.pop("id", None)
+        if isinstance(d.get("created_at"), datetime):
+            d["created_at"] = d["created_at"].isoformat() + "Z"
+        result.append(d)
     return result
 
 
@@ -1888,46 +1819,10 @@ async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = "", _au
 # All routes are namespaced under /adapter/billing/ and gated by
 # require_operator. The browser never holds the AgentX secret: these handlers
 # forward to AgentX via _agentx_internal over the internal Docker network.
+#
+# No local billing storage — PostgreSQL (via AgentX) is the single source of
+# truth for wallets, ledger entries, and payments.
 # ---------------------------------------------------------------------------
-
-
-def _iso_utc(value: datetime) -> str:
-    """ISO-8601 in UTC that JavaScript's Date can parse.
-
-    Datetimes read back from MongoDB are naive UTC; ones built in-request are
-    timezone-aware. Appending "Z" to an aware value would produce an invalid
-    "...+00:00Z", so normalise both cases.
-    """
-    if value.tzinfo is None:
-        return value.isoformat() + "Z"
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _serialize_billing_account(doc: dict) -> dict:
-    """Serialize a billing_accounts document for a JSON response."""
-    doc = dict(doc)
-    doc.pop("_id", None)
-    for key in ("created_at", "updated_at"):
-        value = doc.get(key)
-        if isinstance(value, datetime):
-            doc[key] = _iso_utc(value)
-    return doc
-
-
-def _serialize_payment(doc: dict) -> dict:
-    """Serialize a payments document for a JSON response.
-
-    The MongoDB _id is exposed as a string `payment_id` because it is the
-    source of the idempotency key and the retry endpoint needs it.
-    """
-    doc = dict(doc)
-    _id = doc.pop("_id", None)
-    if _id is not None:
-        doc["payment_id"] = str(_id)
-    value = doc.get("created_at")
-    if isinstance(value, datetime):
-        doc["created_at"] = _iso_utc(value)
-    return doc
 
 
 _LIVE_BALANCE_FIELDS = (
@@ -1942,11 +1837,7 @@ _LIVE_BALANCE_FIELDS = (
 
 
 def _apply_live_balance(account: dict, resolved: dict) -> dict:
-    """Copy AgentX's live balance fields onto a serialized billing account.
-
-    Balances are always read live from AgentX, never cached locally (R7.8).
-    The stored email is kept if AgentX has none.
-    """
+    """Copy AgentX's live balance fields onto an account dict."""
     for field in _LIVE_BALANCE_FIELDS:
         value = resolved.get(field)
         if field == "email" and not value:
@@ -1955,71 +1846,59 @@ def _apply_live_balance(account: dict, resolved: dict) -> dict:
     return account
 
 
-async def _resolve_org_from_agent(agent_phone: str) -> dict:
-    """Resolve an AgentX organization from an agent's stored API key.
-
-    The operator never types an organization id — it is derived from the
-    api_key already stored on the agent document, then confirmed via the
-    resolved email.
-    """
-    if agents_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    clean = agent_phone.replace("%2B", "+").replace("whatsapp:", "").strip()
-    agent = await agents_collection.find_one({"phone_number": clean})
-    if not agent:
-        raise HTTPException(
-            status_code=404, detail=f"No agent found for {clean}"
-        )
-
-    api_key = (agent.get("api_key") or "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Agent {clean} has no API key configured",
-        )
-
-    # Ask AgentX to resolve the org + balance from the raw key.
-    return await _agentx_internal(
-        "POST", "/resolve-account", {"api_key": api_key}
-    )
-
-
 @app.post("/adapter/billing/resolve")
 async def billing_resolve(
     request: Request, _auth: bool = Depends(require_operator)
 ):
-    """Preview the AgentX account for an agent's phone number WITHOUT saving.
-
-    Lets the operator confirm the resolved email + balance before creating a
-    billing account.
-    """
+    """Preview the AgentX account for an agent's phone number WITHOUT saving."""
     data = await request.json()
     agent_phone = (data.get("agent_phone") or "").strip()
     if not agent_phone:
         raise HTTPException(status_code=400, detail="agent_phone is required")
 
-    resolved = await _resolve_org_from_agent(agent_phone)
-    return resolved
+    # Look up agent from PostgreSQL
+    clean = agent_phone.replace("%2B", "+").replace("whatsapp:", "").strip()
+    if pg_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    agent = await pg_pool.fetchrow("SELECT api_key FROM wa_agents WHERE phone_number = $1", clean)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent found for {clean}")
+    api_key = (agent["api_key"] or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"Agent {clean} has no API key configured")
+
+    return await _agentx_internal("POST", "/resolve-account", {"api_key": api_key})
 
 
 @app.get("/adapter/billing/accounts")
 async def billing_list_accounts(_auth: bool = Depends(require_operator)):
-    """List saved billing accounts, each with a live balance from AgentX."""
-    if billing_accounts_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    """List all AgentX organizations directly from PostgreSQL via internal API.
+
+    Reads live from AgentX so every org is always visible without manual steps.
+    """
+    try:
+        orgs = await _agentx_internal("GET", "/organizations")
+    except HTTPException as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach AgentX organizations API ({e.status_code}): {e.detail}",
+        )
 
     accounts = []
-    cursor = billing_accounts_collection.find({}).sort("created_at", -1)
-    async for doc in cursor:
-        account = _serialize_billing_account(doc)
-        # Fetch a live balance; if AgentX is briefly unreachable for one org,
-        # don't fail the whole list — mark that row.
+    for org in orgs.get("organizations", []):
+        organization_id = org.get("organization_id")
+        email = org.get("email") or f"Org {organization_id}"
+        account = {
+            "organization_id": organization_id,
+            "email": email,
+            "label": email,
+            "agent_numbers": [],
+            "created_at": None,
+            "updated_at": None,
+        }
         try:
             live = await _agentx_internal(
-                "POST",
-                "/resolve-account",
-                {"organization_id": doc["organization_id"]},
+                "POST", "/resolve-account", {"organization_id": organization_id},
             )
             _apply_live_balance(account, live)
         except HTTPException as e:
@@ -2029,117 +1908,20 @@ async def billing_list_accounts(_auth: bool = Depends(require_operator)):
     return accounts
 
 
-@app.get("/adapter/billing/organizations")
-async def billing_list_organizations(_auth: bool = Depends(require_operator)):
-    """List every AgentX organization (email + org id + workflow count).
-
-    Powers the org picker in 'Add account'. Also marks which orgs already have
-    a billing account here, so the UI can disable them.
-    """
-    result = await _agentx_internal("GET", "/organizations")
-    orgs = result.get("organizations", [])
-
-    # Mark orgs that already have a billing account in this console.
-    linked_ids: set[int] = set()
-    if billing_accounts_collection is not None:
-        async for doc in billing_accounts_collection.find({}, {"organization_id": 1}):
-            linked_ids.add(doc["organization_id"])
-
-    for org in orgs:
-        org["already_added"] = org.get("organization_id") in linked_ids
-
-    return {"organizations": orgs}
-
-
-@app.post("/adapter/billing/accounts")
-async def billing_create_account(
-    request: Request, _auth: bool = Depends(require_operator)
-):
-    """Create a billing account for an organization.
-
-    Billing is per-org: the operator picks an org (by org id) from the
-    directory. The org is validated against AgentX, which also returns the
-    owner email. Legacy callers may still pass agent_phone to resolve the org
-    from an agent's API key.
-    """
-    if billing_accounts_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    data = await request.json()
-    label = (data.get("label") or "").strip()
-    organization_id = data.get("organization_id")
-    agent_phone = (data.get("agent_phone") or "").strip()
-
-    # Resolve the org — preferred path is an explicit organization_id; the
-    # agent_phone path is kept for backward compatibility.
-    if organization_id is not None:
-        if not isinstance(organization_id, int):
-            raise HTTPException(
-                status_code=400, detail="organization_id must be an integer"
-            )
-        resolved = await _agentx_internal(
-            "POST", "/resolve-account", {"organization_id": organization_id}
-        )
-    elif agent_phone:
-        resolved = await _resolve_org_from_agent(agent_phone)
-        organization_id = resolved["organization_id"]
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="organization_id (or agent_phone) is required",
-        )
-
-    existing = await billing_accounts_collection.find_one(
-        {"organization_id": organization_id}
-    )
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Billing account for org {organization_id} already exists",
-        )
-
-    now = datetime.now(timezone.utc)
-    doc = {
-        "organization_id": organization_id,
-        "email": resolved.get("email"),  # from AgentX, display only
-        "label": label or resolved.get("email") or f"Org {organization_id}",
-        # Agent numbers are no longer how an account is chosen, but keep the
-        # field (empty) so existing serialization/consumers stay happy.
-        "agent_numbers": [agent_phone.replace("whatsapp:", "").strip()]
-        if agent_phone
-        else [],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await billing_accounts_collection.insert_one(doc)
-    logger.info(
-        f"✅ Billing account created for org {organization_id} "
-        f"({resolved.get('email')})"
-    )
-
-    return _apply_live_balance(_serialize_billing_account(doc), resolved)
-
-
 @app.get("/adapter/billing/accounts/{organization_id}")
 async def billing_account_detail(
     organization_id: int, _auth: bool = Depends(require_operator)
 ):
-    """Return a saved account plus its live balance and AgentX ledger."""
-    if billing_accounts_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    doc = await billing_accounts_collection.find_one(
-        {"organization_id": organization_id}
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Billing account not found")
-
-    account = _serialize_billing_account(doc)
-
+    """Return an org's live balance and ledger from AgentX."""
     # Live balance
     resolved = await _agentx_internal(
         "POST", "/resolve-account", {"organization_id": organization_id}
     )
+    account = {
+        "organization_id": organization_id,
+        "email": resolved.get("email", ""),
+        "label": resolved.get("email", f"Org {organization_id}"),
+    }
     _apply_live_balance(account, resolved)
 
     # Ledger from AgentX
@@ -2147,145 +1929,20 @@ async def billing_account_detail(
         "GET", f"/{organization_id}/ledger?page=1&limit=50"
     )
 
-    # Local payment records (newest first) so failed/pending ones are visible
-    payments = []
-    if payments_collection is not None:
-        cursor = payments_collection.find(
-            {"organization_id": organization_id}
-        ).sort("created_at", -1)
-        async for pdoc in cursor:
-            payments.append(_serialize_payment(pdoc))
-
-    # Org's workflows (display only — billing is per-org, not per-workflow).
-    # Non-fatal: if AgentX hiccups, show the account without the list.
-    workflows = []
-    try:
-        wf = await _agentx_internal("GET", f"/{organization_id}/workflows")
-        workflows = wf.get("workflows", [])
-    except HTTPException:
-        workflows = []
-
-    return {
-        "account": account,
-        "ledger": ledger,
-        "payments": payments,
-        "workflows": workflows,
-    }
-
-
-@app.post("/adapter/billing/accounts/{organization_id}/currency")
-async def billing_set_currency(
-    organization_id: int, request: Request, _auth: bool = Depends(require_operator)
-):
-    """Set the account's display currency (admin choice: INR or USD).
-
-    This fixes the currency shown to the customer AND the only currency in
-    which payments may be recorded for this account. USD needs no rate; INR
-    (or any non-USD) requires a positive fx rate (1 unit = X USD).
-    """
-    data = await request.json()
-    currency = (data.get("currency") or "").strip().upper()
-    if currency not in ("INR", "USD"):
-        raise HTTPException(status_code=400, detail="currency must be INR or USD")
-
-    payload: dict = {"display_currency": currency}
-    if currency == "USD":
-        payload["fx_rate_to_usd"] = "1"
-    else:
-        rate = data.get("fx_rate_to_usd")
-        if rate is None or str(rate).strip() == "":
-            raise HTTPException(
-                status_code=400,
-                detail=f"{currency} requires an exchange rate (fx_rate_to_usd)",
-            )
-        payload["fx_rate_to_usd"] = str(rate)
-
-    result = await _agentx_internal(
-        "POST", f"/{organization_id}/currency", payload
-    )
-    logger.info(
-        f"Billing account org {organization_id} currency set to {currency}"
-    )
-    return result
-
-
-async def _execute_grant(payment_doc: dict) -> dict:
-    """Call AgentX grant for a payment doc, deriving the key from its _id.
-
-    Updates the payment record to confirmed/failed and returns the updated
-    serialized payment. The idempotency key is grant:{_id} so a retry (which
-    reuses the same _id) can never double-credit.
-    """
-    payment_id = payment_doc["_id"]
-    idempotency_key = f"grant:{payment_id}"
-
-    grant_payload = {
-        "organization_id": payment_doc["organization_id"],
-        "idempotency_key": idempotency_key,
-        "paid_amount_minor": payment_doc["paid_amount_minor"],
-        "paid_currency": payment_doc["paid_currency"],
-        "note": payment_doc.get("note"),
-        "created_by": payment_doc.get("created_by"),
-    }
-    if payment_doc.get("fx_rate_to_usd") is not None:
-        grant_payload["fx_rate_to_usd"] = str(payment_doc["fx_rate_to_usd"])
-
-    try:
-        result = await _agentx_internal("POST", "/grant", grant_payload)
-    except HTTPException as e:
-        await payments_collection.update_one(
-            {"_id": payment_id},
-            {"$set": {"status": "failed", "error": str(e.detail)}},
-        )
-        logger.error(
-            f"Grant failed for payment {payment_id} "
-            f"(org {payment_doc['organization_id']}): {e.detail}"
-        )
-        updated = await payments_collection.find_one({"_id": payment_id})
-        return _serialize_payment(updated)
-
-    await payments_collection.update_one(
-        {"_id": payment_id},
-        {
-            "$set": {
-                "status": "confirmed",
-                "agentx_entry_id": result.get("entry_id"),
-                "credited_usd": result.get("credited_usd"),
-                "duplicate": result.get("duplicate", False),
-                "error": None,
-            }
-        },
-    )
-    logger.info(
-        f"✅ Grant confirmed for payment {payment_id}: "
-        f"${result.get('credited_usd')} (duplicate={result.get('duplicate')})"
-    )
-    updated = await payments_collection.find_one({"_id": payment_id})
-    return _serialize_payment(updated)
+    return {"account": account, "ledger": ledger, "payments": []}
 
 
 @app.post("/adapter/billing/accounts/{organization_id}/payments")
 async def billing_record_payment(
     organization_id: int, request: Request, _auth: bool = Depends(require_operator)
 ):
-    """Two-phase payment: insert pending, then grant with key = grant:{_id}.
+    """Record a payment by calling AgentX /grant directly.
 
-    1. Insert the payment doc with status 'pending' — Mongo returns _id.
-    2. Call AgentX grant with idempotency_key grant:{_id}.
-    3. Success -> confirmed; failure -> failed (visible + retryable).
+    The grant endpoint is idempotent (keyed by idempotency_key), so retries
+    are safe. No local payment storage needed.
     """
-    if payments_collection is None or billing_accounts_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    account = await billing_accounts_collection.find_one(
-        {"organization_id": organization_id}
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="Billing account not found")
-
     data = await request.json()
 
-    # Amount arrives as integer minor units (the frontend converts, not us).
     paid_amount_minor = data.get("paid_amount_minor")
     if not isinstance(paid_amount_minor, int) or paid_amount_minor <= 0:
         raise HTTPException(
@@ -2295,99 +1952,38 @@ async def billing_record_payment(
 
     paid_currency = (data.get("paid_currency") or "").strip().upper()
     if len(paid_currency) != 3:
-        raise HTTPException(
-            status_code=400, detail="paid_currency must be a 3-letter code"
-        )
+        raise HTTPException(status_code=400, detail="paid_currency must be a 3-letter code")
 
-    fx_rate_to_usd = data.get("fx_rate_to_usd")  # optional, string/number
-    note = (data.get("note") or "").strip() or None
-    created_by = (data.get("created_by") or "").strip() or None
+    # Generate idempotency key from client_request_id or a fresh UUID
+    client_request_id = data.get("client_request_id") or str(uuid.uuid4())
 
-    # Optional submission id from the dashboard. Reusing it returns the same
-    # payment, so a resubmit after a lost response can't create a second one.
-    client_request_id = data.get("client_request_id")
-    if client_request_id is not None:
-        if (
-            not isinstance(client_request_id, str)
-            or not 8 <= len(client_request_id) <= 64
-        ):
-            raise HTTPException(
-                status_code=400, detail="client_request_id must be 8-64 characters"
-            )
-
-    async def _replay(existing: dict) -> dict:
-        if existing["organization_id"] != organization_id:
-            raise HTTPException(
-                status_code=409,
-                detail="client_request_id already used for another account",
-            )
-        if existing.get("status") == "confirmed":
-            return _serialize_payment(existing)
-        # Same _id -> same grant:{_id} key, so this can't double-credit.
-        return await _execute_grant(existing)
-
-    if client_request_id:
-        existing = await payments_collection.find_one(
-            {"client_request_id": client_request_id}
-        )
-        if existing:
-            return await _replay(existing)
-
-    # Phase 1: insert the pending record. Its _id becomes the idempotency key.
-    now = datetime.now(timezone.utc)
-    payment_doc = {
+    grant_payload = {
         "organization_id": organization_id,
+        "idempotency_key": f"grant:{client_request_id}",
         "paid_amount_minor": paid_amount_minor,
         "paid_currency": paid_currency,
-        "fx_rate_to_usd": fx_rate_to_usd,
-        "note": note,
-        "created_by": created_by,
-        "status": "pending",
-        "agentx_entry_id": None,
-        "credited_usd": None,
-        "error": None,
-        "created_at": now,
+        "note": (data.get("note") or "").strip() or None,
     }
-    if client_request_id:
-        payment_doc["client_request_id"] = client_request_id
+
+    fx_rate = data.get("fx_rate_to_usd")
+    if fx_rate is not None:
+        grant_payload["fx_rate_to_usd"] = str(fx_rate)
 
     try:
-        insert_result = await payments_collection.insert_one(payment_doc)
-    except DuplicateKeyError:
-        # Two identical submissions raced; the other one won the insert.
-        existing = await payments_collection.find_one(
-            {"client_request_id": client_request_id}
-        )
-        return await _replay(existing)
-    payment_doc["_id"] = insert_result.inserted_id
+        result = await _agentx_internal("POST", "/grant", grant_payload)
+    except HTTPException as e:
+        logger.error(f"Grant failed for org {organization_id}: {e.detail}")
+        raise
 
-    # Phase 2: grant. Key derived from _id so retries never double-credit.
-    return await _execute_grant(payment_doc)
-
-
-@app.post("/adapter/billing/payments/{payment_id}/retry")
-async def billing_retry_payment(
-    payment_id: str, _auth: bool = Depends(require_operator)
-):
-    """Retry a failed grant, reusing the SAME idempotency key (grant:{_id}).
-
-    AgentX either applies the grant once or reports duplicate — there is no
-    sequence of retries that credits twice.
-    """
-    if payments_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    try:
-        oid = ObjectId(payment_id)
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid payment_id")
-
-    payment_doc = await payments_collection.find_one({"_id": oid})
-    if not payment_doc:
-        raise HTTPException(status_code=404, detail="Payment not found")
-
-    if payment_doc.get("status") == "confirmed":
-        # Already done — return as-is rather than re-granting.
-        return _serialize_payment(payment_doc)
-
-    return await _execute_grant(payment_doc)
+    logger.info(
+        f"✅ Grant confirmed for org {organization_id}: "
+        f"${result.get('credited_usd')} (duplicate={result.get('duplicate')})"
+    )
+    return {
+        "status": "confirmed",
+        "organization_id": organization_id,
+        "credited_usd": result.get("credited_usd"),
+        "balance_usd": result.get("balance_usd"),
+        "entry_id": result.get("entry_id"),
+        "duplicate": result.get("duplicate", False),
+    }
