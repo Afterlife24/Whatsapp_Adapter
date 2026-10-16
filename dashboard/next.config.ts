@@ -2,6 +2,9 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  
+  // Base path for production deployment under /dashboard/whatsapp
+  basePath: process.env.NODE_ENV === "production" ? "/dashboard/whatsapp" : "",
 
   // Proxy /api/adapter/* → adapter backend (same-origin cookie fix).
   //
