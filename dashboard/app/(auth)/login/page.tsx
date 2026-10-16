@@ -15,7 +15,8 @@ export default function LoginPage() {
     try {
       await login(password);
       // Full navigation so middleware sees the new cookie on a fresh request.
-      window.location.href = "/";
+      // Redirect to dashboard overview (basePath is /dashboard/whatsapp)
+      window.location.href = "/dashboard/whatsapp";
     } catch (err: any) {
       setError(err.message || "Invalid password");
       setLoading(false);
