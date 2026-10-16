@@ -29,7 +29,7 @@ async function req<T>(path: string, options?: RequestInit): Promise<T> {
 
 // ---- Auth ----
 export const login = async (password: string): Promise<void> => {
-  const res = await fetch(`${PROXY_BASE}/adapter/auth/login`, {
+  const res = await fetch(`${PROXY_BASE}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -42,7 +42,7 @@ export const login = async (password: string): Promise<void> => {
 };
 
 export const logout = async (): Promise<void> => {
-  await fetch(`${PROXY_BASE}/adapter/auth/logout`, {
+  await fetch(`${PROXY_BASE}/auth/logout`, {
     method: "POST",
     credentials: "same-origin",
   });
