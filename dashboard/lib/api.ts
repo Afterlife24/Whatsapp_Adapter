@@ -1,12 +1,14 @@
-// All adapter API calls go through the Next.js rewrite proxy at /api/adapter/*
-// so the browser stays on one origin (localhost:3001) and Set-Cookie works.
-// The proxy is configured in next.config.ts rewrites().
-const PROXY_BASE = "/api/adapter";
+// API calls go directly to the backend server
+// In production: https://devagents.afterlife.org.in
+// In development: http://localhost:8001
+const API_BASE = typeof window !== 'undefined' 
+  ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001')
+  : (process.env.ADAPTER_INTERNAL_URL || 'http://whatsapp-adapter:8080');
 
 async function req<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${PROXY_BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
-    credentials: "same-origin", // same origin — cookies sent automatically
+    credentials: "include", // Include cookies in cross-origin requests
     ...options,
   });
 
@@ -29,10 +31,10 @@ async function req<T>(path: string, options?: RequestInit): Promise<T> {
 
 // ---- Auth ----
 export const login = async (password: string): Promise<void> => {
-  const res = await fetch(`${PROXY_BASE}/auth/login`, {
+  const res = await fetch(`${API_BASE}/adapter/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
+    credentials: "include", // Include cookies
     body: JSON.stringify({ password }),
   });
   if (!res.ok) {
@@ -42,9 +44,9 @@ export const login = async (password: string): Promise<void> => {
 };
 
 export const logout = async (): Promise<void> => {
-  await fetch(`${PROXY_BASE}/auth/logout`, {
+  await fetch(`${API_BASE}/adapter/auth/logout`, {
     method: "POST",
-    credentials: "same-origin",
+    credentials: "include",
   });
 };
 
