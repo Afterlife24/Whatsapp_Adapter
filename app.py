@@ -696,7 +696,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
 
 @app.get("/adapter/health")
 async def health():
-    return {"status": "ok", "db": pg_pool is not None}
+    return {"status": "ok", "mongo": pg_pool is not None}
 
 
 @app.post("/whatsapp")
