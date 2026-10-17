@@ -124,7 +124,7 @@ CONVERSATIONS_CACHE: dict = {"data": None, "expires_at": 0}
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="WhatsApp-Dograh Adapter")
+app = FastAPI(title="WhatsApp-Dograh Adapter", root_path="/adapter")
 
 # CORS — allow the dashboard and AgentX UI to connect.
 # Supports multiple origins via comma-separated ADAPTER_CORS_ORIGINS env var.
@@ -694,7 +694,7 @@ async def _store_lead_from_chat(phone_number: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
+@app.get("/adapter/health")
 async def health():
     return {"status": "ok", "db": pg_pool is not None}
 
@@ -1335,7 +1335,7 @@ async def _process_followups() -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/conversations")
+@app.get("/adapter/conversations")
 async def get_conversations(agent_number: str = "", _auth: bool = Depends(require_operator)):
     """Get all conversations for the dashboard (cached 30s)."""
     now_mono = time.monotonic()
@@ -1397,7 +1397,7 @@ async def get_conversations(agent_number: str = "", _auth: bool = Depends(requir
     return conversations
 
 
-@app.get("/messages/{phone_number:path}")
+@app.get("/adapter/messages/{phone_number:path}")
 async def get_messages(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get all messages for a specific conversation."""
     phone_number = phone_number.replace("%3A", ":")
@@ -1419,7 +1419,7 @@ async def get_messages(phone_number: str, _auth: bool = Depends(require_operator
         return MESSAGE_STORE.get(phone_number, [])
 
 
-@app.post("/takeover")
+@app.post("/adapter/takeover")
 async def takeover_conversation(request: Request, _auth: bool = Depends(require_operator)):
     """Human agent takes over a conversation (AI stops responding)."""
     data = await request.json()
@@ -1433,7 +1433,7 @@ async def takeover_conversation(request: Request, _auth: bool = Depends(require_
     return {"success": True, "message": "Takeover successful"}
 
 
-@app.post("/release")
+@app.post("/adapter/release")
 async def release_conversation(request: Request, _auth: bool = Depends(require_operator)):
     """Release conversation back to AI."""
     data = await request.json()
@@ -1542,7 +1542,7 @@ async def receive_lead_data(request: Request):
     return {"success": True}
 
 
-@app.post("/send-message")
+@app.post("/adapter/send-message")
 async def send_message(request: Request, _auth: bool = Depends(require_operator)):
     """Human agent sends a message via the dashboard."""
     data = await request.json()
@@ -1620,7 +1620,7 @@ def _serialize_agent(doc: dict) -> dict:
     return doc
 
 
-@app.get("/agents")
+@app.get("/adapter/agents")
 async def list_agents(_auth: bool = Depends(require_operator)):
     """List all agents."""
     if pg_pool is None:
@@ -1629,7 +1629,7 @@ async def list_agents(_auth: bool = Depends(require_operator)):
     return [_serialize_agent(_row_to_dict(r)) for r in rows]
 
 
-@app.post("/agents")
+@app.post("/adapter/agents")
 async def create_agent(request: Request, _auth: bool = Depends(require_operator)):
     """Create a new agent."""
     if pg_pool is None:
@@ -1677,7 +1677,7 @@ async def create_agent(request: Request, _auth: bool = Depends(require_operator)
     return _serialize_agent(_row_to_dict(row))
 
 
-@app.get("/agents/{phone_number:path}")
+@app.get("/adapter/agents/{phone_number:path}")
 async def get_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Get a single agent by phone number."""
     if pg_pool is None:
@@ -1689,7 +1689,7 @@ async def get_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     return _serialize_agent(_row_to_dict(row))
 
 
-@app.put("/agents/{phone_number:path}")
+@app.put("/adapter/agents/{phone_number:path}")
 async def update_agent(phone_number: str, request: Request, _auth: bool = Depends(require_operator)):
     """Update an agent's config."""
     if pg_pool is None:
@@ -1746,7 +1746,7 @@ async def update_agent(phone_number: str, request: Request, _auth: bool = Depend
     return _serialize_agent(_row_to_dict(row))
 
 
-@app.delete("/agents/{phone_number:path}")
+@app.delete("/adapter/agents/{phone_number:path}")
 async def delete_agent(phone_number: str, _auth: bool = Depends(require_operator)):
     """Delete an agent."""
     if pg_pool is None:
@@ -1759,7 +1759,7 @@ async def delete_agent(phone_number: str, _auth: bool = Depends(require_operator
     return {"success": True, "message": f"Agent {phone_number} deleted"}
 
 
-@app.post("/agents/{phone_number:path}/reset-quota")
+@app.post("/adapter/agents/{phone_number:path}/reset-quota")
 async def reset_agent_quota(phone_number: str, _auth: bool = Depends(require_operator)):
     """Reset quota_used to 0 for an agent."""
     if pg_pool is None:
@@ -1783,7 +1783,7 @@ async def reset_agent_quota(phone_number: str, _auth: bool = Depends(require_ope
 # Leads endpoint
 # ---------------------------------------------------------------------------
 
-@app.get("/leads")
+@app.get("/adapter/leads")
 async def get_leads(limit: int = 100, skip: int = 0, agent_number: str = "", _auth: bool = Depends(require_operator)):
     """Get all captured leads, newest first."""
     if pg_pool is None:

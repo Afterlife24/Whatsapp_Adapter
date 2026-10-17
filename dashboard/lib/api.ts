@@ -77,23 +77,23 @@ export interface Agent {
   updated_at?: string;
 }
 
-export const getAgents = () => req<Agent[]>("/agents");
+export const getAgents = () => req<Agent[]>("/adapter/agents");
 export const getAgent = (phone: string) =>
-  req<Agent>(`/agents/${encodeURIComponent(phone)}`);
+  req<Agent>(`/adapter/agents/${encodeURIComponent(phone)}`);
 export const createAgent = (data: Partial<Agent>) =>
-  req<Agent>("/agents", { method: "POST", body: JSON.stringify(data) });
+  req<Agent>("/adapter/agents", { method: "POST", body: JSON.stringify(data) });
 export const updateAgent = (phone: string, data: Partial<Agent>) =>
-  req<Agent>(`/agents/${encodeURIComponent(phone)}`, {
+  req<Agent>(`/adapter/agents/${encodeURIComponent(phone)}`, {
     method: "PUT",
     body: JSON.stringify(data),
   });
 export const deleteAgent = (phone: string) =>
-  req<{ success: boolean }>(`/agents/${encodeURIComponent(phone)}`, {
+  req<{ success: boolean }>(`/adapter/agents/${encodeURIComponent(phone)}`, {
     method: "DELETE",
   });
 export const resetQuota = (phone: string) =>
   req<{ success: boolean }>(
-    `/agents/${encodeURIComponent(phone)}/reset-quota`,
+    `/adapter/agents/${encodeURIComponent(phone)}/reset-quota`,
     { method: "POST" }
   );
 
@@ -109,7 +109,7 @@ export interface Conversation {
 
 export const getConversations = (agentNumber?: string) =>
   req<Conversation[]>(
-    `/conversations${agentNumber ? `?agent_number=${encodeURIComponent(agentNumber)}` : ""}`
+    `/adapter/conversations${agentNumber ? `?agent_number=${encodeURIComponent(agentNumber)}` : ""}`
   );
 
 // ---- Messages ----
@@ -121,24 +121,24 @@ export interface Message {
 }
 
 export const getMessages = (phone: string) =>
-  req<Message[]>(`/messages/${encodeURIComponent(phone)}`);
+  req<Message[]>(`/adapter/messages/${encodeURIComponent(phone)}`);
 
 // ---- Takeover ----
 export const takeover = (phone: string) =>
-  req<{ success: boolean }>("/takeover", {
+  req<{ success: boolean }>("/adapter/takeover", {
     method: "POST",
     body: JSON.stringify({ phone_number: phone }),
   });
 
 export const release = (phone: string) =>
-  req<{ success: boolean }>("/release", {
+  req<{ success: boolean }>("/adapter/release", {
     method: "POST",
     body: JSON.stringify({ phone_number: phone }),
   });
 
 export const sendMessage = (phone: string, message: string) =>
   req<{ success: boolean; error?: string; error_code?: string }>(
-    "/send-message",
+    "/adapter/send-message",
     {
       method: "POST",
       body: JSON.stringify({ phone_number: phone, message }),
@@ -164,7 +164,7 @@ export interface Lead {
 
 export const getLeads = (agentNumber?: string) =>
   req<Lead[]>(
-    `/leads${agentNumber ? `?agent_number=${encodeURIComponent(agentNumber)}` : ""}`
+    `/adapter/leads${agentNumber ? `?agent_number=${encodeURIComponent(agentNumber)}` : ""}`
   );
 
 // ---- Billing (Phase 6) ----
