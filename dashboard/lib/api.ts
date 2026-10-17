@@ -1,5 +1,5 @@
-// API calls go directly to the backend server
-// In production: https://devagents.afterlife.org.in
+// API calls go to the adapter backend
+// In production: same domain via nginx proxy (/adapter/)
 // In development: http://localhost:8001
 const API_BASE = typeof window !== 'undefined' 
   ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001')
