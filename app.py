@@ -124,7 +124,7 @@ CONVERSATIONS_CACHE: dict = {"data": None, "expires_at": 0}
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="WhatsApp-Dograh Adapter", root_path="/adapter")
+app = FastAPI(title="WhatsApp-Dograh Adapter")
 
 # CORS — allow the dashboard and AgentX UI to connect.
 # Supports multiple origins via comma-separated ADAPTER_CORS_ORIGINS env var.
