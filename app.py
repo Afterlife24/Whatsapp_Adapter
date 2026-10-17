@@ -1929,7 +1929,100 @@ async def billing_account_detail(
         "GET", f"/{organization_id}/ledger?page=1&limit=50"
     )
 
-    return {"account": account, "ledger": ledger, "payments": []}
+    # Org's workflows (display only — billing is per-org, not per-workflow).
+    # Non-fatal: if AgentX hiccups, show the account without the list.
+    try:
+        wf = await _agentx_internal("GET", f"/{organization_id}/workflows")
+        workflows = wf.get("workflows", [])
+    except HTTPException:
+        workflows = []
+
+    # No local payment storage: confirmed top-ups appear in the ledger.
+    return {
+        "account": account,
+        "ledger": ledger,
+        "payments": [],
+        "workflows": workflows,
+    }
+
+
+@app.get("/adapter/billing/organizations")
+async def billing_list_organizations(_auth: bool = Depends(require_operator)):
+    """List every AgentX organization for the 'Add account' picker.
+
+    Every organization is listed on the billing page automatically (no local
+    account records), so all of them are reported as already added.
+    """
+    result = await _agentx_internal("GET", "/organizations")
+    orgs = result.get("organizations", [])
+    for org in orgs:
+        org["already_added"] = True
+    return {"organizations": orgs}
+
+
+@app.post("/adapter/billing/accounts")
+async def billing_create_account(
+    request: Request, _auth: bool = Depends(require_operator)
+):
+    """Confirm an organization exists and return it as a billing account.
+
+    Accounts are not stored locally — every AgentX org already appears on the
+    billing page — so this only validates the org and returns its live balance.
+    """
+    data = await request.json()
+    organization_id = data.get("organization_id")
+    if not isinstance(organization_id, int):
+        raise HTTPException(
+            status_code=400, detail="organization_id must be an integer"
+        )
+
+    resolved = await _agentx_internal(
+        "POST", "/resolve-account", {"organization_id": organization_id}
+    )
+    email = resolved.get("email") or f"Org {organization_id}"
+    account = {
+        "organization_id": organization_id,
+        "email": email,
+        "label": (data.get("label") or "").strip() or email,
+        "agent_numbers": [],
+        "created_at": None,
+        "updated_at": None,
+    }
+    return _apply_live_balance(account, resolved)
+
+
+@app.post("/adapter/billing/accounts/{organization_id}/currency")
+async def billing_set_currency(
+    organization_id: int, request: Request, _auth: bool = Depends(require_operator)
+):
+    """Set the account's display currency (INR or USD).
+
+    Fixes the currency shown to the customer and the only currency payments
+    may be recorded in. USD needs no rate; INR requires a positive fx rate
+    (1 INR = X USD).
+    """
+    data = await request.json()
+    currency = (data.get("currency") or "").strip().upper()
+    if currency not in ("INR", "USD"):
+        raise HTTPException(status_code=400, detail="currency must be INR or USD")
+
+    payload: dict = {"display_currency": currency}
+    if currency == "USD":
+        payload["fx_rate_to_usd"] = "1"
+    else:
+        rate = data.get("fx_rate_to_usd")
+        if rate is None or str(rate).strip() == "":
+            raise HTTPException(
+                status_code=400,
+                detail=f"{currency} requires an exchange rate (fx_rate_to_usd)",
+            )
+        payload["fx_rate_to_usd"] = str(rate)
+
+    result = await _agentx_internal(
+        "POST", f"/{organization_id}/currency", payload
+    )
+    logger.info(f"Billing org {organization_id} currency set to {currency}")
+    return result
 
 
 @app.post("/adapter/billing/accounts/{organization_id}/payments")
@@ -1956,16 +2049,17 @@ async def billing_record_payment(
 
     # Generate idempotency key from client_request_id or a fresh UUID
     client_request_id = data.get("client_request_id") or str(uuid.uuid4())
+    note = (data.get("note") or "").strip() or None
+    created_by = (data.get("created_by") or "").strip() or None
+    fx_rate = data.get("fx_rate_to_usd")
 
     grant_payload = {
         "organization_id": organization_id,
         "idempotency_key": f"grant:{client_request_id}",
         "paid_amount_minor": paid_amount_minor,
         "paid_currency": paid_currency,
-        "note": (data.get("note") or "").strip() or None,
+        "note": note,
     }
-
-    fx_rate = data.get("fx_rate_to_usd")
     if fx_rate is not None:
         grant_payload["fx_rate_to_usd"] = str(fx_rate)
 
@@ -1979,11 +2073,20 @@ async def billing_record_payment(
         f"✅ Grant confirmed for org {organization_id}: "
         f"${result.get('credited_usd')} (duplicate={result.get('duplicate')})"
     )
+    # Shape matches the dashboard's Payment type so the success panel can
+    # render the amount received and the USD credited.
     return {
-        "status": "confirmed",
+        "payment_id": client_request_id,
         "organization_id": organization_id,
+        "paid_amount_minor": paid_amount_minor,
+        "paid_currency": paid_currency,
+        "fx_rate_to_usd": str(fx_rate) if fx_rate is not None else None,
+        "note": note,
+        "created_by": created_by,
+        "status": "confirmed",
+        "agentx_entry_id": result.get("entry_id"),
         "credited_usd": result.get("credited_usd"),
-        "balance_usd": result.get("balance_usd"),
-        "entry_id": result.get("entry_id"),
         "duplicate": result.get("duplicate", False),
+        "error": None,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }

@@ -139,6 +139,8 @@ export function formatUsdPrecise(value: unknown, signed = false): string {
 
 /** Format integer minor units (paise/cents) as money. */
 export function formatMinor(minor: number, currency: string): string {
+  // Guard: BigInt(undefined/NaN/1.5) throws and would crash the whole page.
+  if (!Number.isSafeInteger(minor)) return "—";
   return formatMoney(scaledToString(BigInt(minor), 2), currency);
 }
 
