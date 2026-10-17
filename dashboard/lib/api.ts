@@ -52,7 +52,7 @@ export const logout = async (): Promise<void> => {
 
 // ---- Health ----
 export const getHealth = () =>
-  req<{ status: string; mongo: boolean }>("/health");
+  req<{ status: string; mongo: boolean }>("/adapter/health");
 
 // ---- Agents ----
 export interface Agent {
