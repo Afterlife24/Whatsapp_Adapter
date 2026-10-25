@@ -333,6 +333,145 @@ export const setAccountCurrency = (organizationId: number, input: SetCurrencyInp
     body: JSON.stringify(input),
   });
 
+// ---- Model Pricing (Stage C) ----
+// Rate fields arrive as decimal strings (exact). Format with lib/money, never
+// parseFloat. Chat/embedding rows come from LiteLLM; STT/TTS are manual.
+
+export type PricingKind = "chat" | "embedding" | "tts" | "stt" | "speech_to_speech";
+export type PricingSource = "litellm" | "manual";
+export type PricingUnit =
+  | "per_1m_token"
+  | "per_1m_char"
+  | "per_hour"
+  | "per_character"
+  | "per_second";
+export type PricingStatus = "active" | "deprecated" | "missing";
+export type PricingChangeType = "new" | "price_change" | "deprecated";
+
+export interface PricingModel {
+  id: number;
+  provider: string;
+  model_identifier: string;
+  kind: PricingKind;
+  source: PricingSource;
+  unit: PricingUnit;
+  input_per_1m: string | null;
+  output_per_1m: string | null;
+  cached_input_per_1m: string | null;
+  embedding_per_1m: string | null;
+  rt_text_input_per_1m: string | null;
+  rt_text_output_per_1m: string | null;
+  rt_audio_input_per_1m: string | null;
+  rt_audio_output_per_1m: string | null;
+  rate: string | null;
+  status: PricingStatus;
+  is_enabled: boolean;
+  effective_from: string | null;
+}
+
+export interface PricingProviderSetting {
+  provider: string;
+  is_enabled: boolean;
+}
+
+export interface PricingModelsResponse {
+  models: PricingModel[];
+  providers: PricingProviderSetting[];
+}
+
+export interface PricingPendingItem {
+  id: number;
+  provider: string;
+  model_identifier: string;
+  kind: PricingKind;
+  change_type: PricingChangeType;
+  proposed_input_per_1m: string | null;
+  proposed_output_per_1m: string | null;
+  proposed_cached_input_per_1m: string | null;
+  proposed_embedding_per_1m: string | null;
+  proposed_rt_text_input_per_1m: string | null;
+  proposed_rt_text_output_per_1m: string | null;
+  proposed_rt_audio_input_per_1m: string | null;
+  proposed_rt_audio_output_per_1m: string | null;
+  proposed_status: string | null;
+  current_input_per_1m: string | null;
+  current_output_per_1m: string | null;
+  current_cached_input_per_1m: string | null;
+  current_embedding_per_1m: string | null;
+  current_rt_text_input_per_1m: string | null;
+  current_rt_text_output_per_1m: string | null;
+  current_rt_audio_input_per_1m: string | null;
+  current_rt_audio_output_per_1m: string | null;
+  detected_at: string | null;
+}
+
+export interface PricingSyncResult {
+  sync_run_id: string;
+  new: number;
+  price_change: number;
+  missing: number;
+  auto_approved: number;
+  total: number;
+}
+
+export interface ManualModelInput {
+  provider: string;
+  model_identifier: string;
+  kind: "tts" | "stt";
+  /** Decimal string in the stored unit: USD per 1M chars (tts) or USD per hour (stt). */
+  rate: string;
+  /**
+   * Enabled state to apply. Omit when only changing the rate of an existing
+   * model — the backend then preserves the model's current enabled state and a
+   * brand-new model defaults to enabled.
+   */
+  is_enabled?: boolean;
+}
+
+export const getPricingModels = () =>
+  req<PricingModelsResponse>("/adapter/pricing/models");
+
+export const getPricingPending = () =>
+  req<{ pending: PricingPendingItem[] }>("/adapter/pricing/pending").then(
+    (r) => r.pending,
+  );
+
+export const syncPricing = () =>
+  req<PricingSyncResult>("/adapter/pricing/sync", { method: "POST" });
+
+export const approvePending = (pendingId: number) =>
+  req<{ approved_id: number }>(`/adapter/pricing/pending/${pendingId}/approve`, {
+    method: "POST",
+  });
+
+export const rejectPending = (pendingId: number) =>
+  req<{ rejected_id: number }>(`/adapter/pricing/pending/${pendingId}/reject`, {
+    method: "POST",
+  });
+
+export const setModelEnabled = (pricingId: number, enabled: boolean) =>
+  req<PricingModel>(
+    `/adapter/pricing/models/${pricingId}/${enabled ? "enable" : "disable"}`,
+    { method: "POST" },
+  );
+
+export const setProviderEnabled = (provider: string, enabled: boolean) =>
+  req<PricingProviderSetting>(
+    `/adapter/pricing/providers/${encodeURIComponent(provider)}/${enabled ? "enable" : "disable"}`,
+    { method: "POST" },
+  );
+
+export const addManualModel = (input: ManualModelInput) =>
+  req<PricingModel>("/adapter/pricing/manual", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+
+export const deletePricingModel = (pricingId: number) =>
+  req<{ deleted_id: number }>(`/adapter/pricing/models/${pricingId}`, {
+    method: "DELETE",
+  });
+
 /**
  * Turn a thrown `req` error ("409: {\"detail\": ...}") into a readable message.
  * Unwraps FastAPI `detail` fields, including AgentX errors the adapter relays.
