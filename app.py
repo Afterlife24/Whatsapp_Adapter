@@ -1114,6 +1114,32 @@ async def _agentx_internal(
     return response.json()
 
 
+async def _agentx_pricing(
+    method: str, path: str, payload: dict | None = None
+) -> dict:
+    """Call AgentX's internal model-pricing API with the shared secret.
+
+    Same service-to-service pattern as _agentx_internal, targeting
+    /internal/pricing instead of /internal/credits. The dashboard never holds
+    the secret — only this adapter forwards it over the internal network.
+    """
+    url = f"{AGENTX_INTERNAL_BASE}/internal/pricing{path}"
+    headers = {
+        "X-Dograh-Internal-Secret": DOGRAH_INTERNAL_SECRET,
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(method, url, json=payload, headers=headers)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"AgentX pricing API error: {response.text[:300]}",
+        )
+
+    return response.json()
+
+
 # ---------------------------------------------------------------------------
 # Quota
 # ---------------------------------------------------------------------------
@@ -2090,3 +2116,94 @@ async def billing_record_payment(
         "error": None,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+
+
+@app.post("/adapter/billing/payments/{payment_id}/retry")
+async def billing_retry_payment(
+    payment_id: str, _auth: bool = Depends(require_operator)
+):
+    """Payments are not stored locally (AgentX's ledger is the source of truth),
+    so there is no saved failed payment to retry. A failed grant surfaces as an
+    error at submit time; resubmitting with the same client_request_id is safe
+    because the grant idempotency key is grant:{client_request_id}.
+    """
+    raise HTTPException(
+        status_code=404,
+        detail="Payment retry is not available: payments are not stored. Resubmit the payment instead.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model Pricing (Stage C) — admin dashboard proxy
+#
+# Thin proxies under /adapter/pricing/* gated by require_operator. Each forwards
+# to AgentX's /internal/pricing API via _agentx_pricing; the browser never holds
+# the internal secret. AgentX owns all pricing data and logic.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/adapter/pricing/models")
+async def pricing_list_models(_auth: bool = Depends(require_operator)):
+    """All current pricing rows + provider settings for the admin table."""
+    return await _agentx_pricing("GET", "/models")
+
+
+@app.get("/adapter/pricing/pending")
+async def pricing_list_pending(_auth: bool = Depends(require_operator)):
+    """The current sync diff awaiting admin approval."""
+    return await _agentx_pricing("GET", "/pending")
+
+
+@app.post("/adapter/pricing/sync")
+async def pricing_sync(_auth: bool = Depends(require_operator)):
+    """Fetch the LiteLLM catalog and compute a diff into the pending queue."""
+    return await _agentx_pricing("POST", "/sync")
+
+
+@app.post("/adapter/pricing/pending/{pending_id}/approve")
+async def pricing_approve(pending_id: int, _auth: bool = Depends(require_operator)):
+    """Apply one pending diff to live pricing (versioned write)."""
+    return await _agentx_pricing("POST", f"/pending/{pending_id}/approve")
+
+
+@app.post("/adapter/pricing/pending/{pending_id}/reject")
+async def pricing_reject(pending_id: int, _auth: bool = Depends(require_operator)):
+    """Discard a pending diff without applying it."""
+    return await _agentx_pricing("POST", f"/pending/{pending_id}/reject")
+
+
+@app.post("/adapter/pricing/models/{pricing_id}/enable")
+async def pricing_enable_model(pricing_id: int, _auth: bool = Depends(require_operator)):
+    """Enable a model → selectable in AgentX."""
+    return await _agentx_pricing("POST", f"/models/{pricing_id}/enable")
+
+
+@app.post("/adapter/pricing/models/{pricing_id}/disable")
+async def pricing_disable_model(pricing_id: int, _auth: bool = Depends(require_operator)):
+    """Disable a model → hidden from AgentX."""
+    return await _agentx_pricing("POST", f"/models/{pricing_id}/disable")
+
+
+@app.post("/adapter/pricing/providers/{provider}/enable")
+async def pricing_enable_provider(provider: str, _auth: bool = Depends(require_operator)):
+    """Enable a whole provider."""
+    return await _agentx_pricing("POST", f"/providers/{provider}/enable")
+
+
+@app.post("/adapter/pricing/providers/{provider}/disable")
+async def pricing_disable_provider(provider: str, _auth: bool = Depends(require_operator)):
+    """Disable a whole provider → hides all its models from AgentX."""
+    return await _agentx_pricing("POST", f"/providers/{provider}/disable")
+
+
+@app.post("/adapter/pricing/manual")
+async def pricing_add_manual(request: Request, _auth: bool = Depends(require_operator)):
+    """Add a manual STT/TTS model with its per-unit rate."""
+    data = await request.json()
+    return await _agentx_pricing("POST", "/manual", data)
+
+
+@app.delete("/adapter/pricing/models/{pricing_id}")
+async def pricing_delete_model(pricing_id: int, _auth: bool = Depends(require_operator)):
+    """Delete a pricing row (used for removing manual STT/TTS models)."""
+    return await _agentx_pricing("DELETE", f"/models/{pricing_id}")
