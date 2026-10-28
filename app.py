@@ -2116,49 +2116,21 @@ async def billing_record_payment(
         "error": None,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    if client_request_id:
-        payment_doc["client_request_id"] = client_request_id
-
-    try:
-        insert_result = await payments_collection.insert_one(payment_doc)
-    except DuplicateKeyError:
-        # Two identical submissions raced; the other one won the insert.
-        existing = await payments_collection.find_one(
-            {"client_request_id": client_request_id}
-        )
-        return await _replay(existing)
-    payment_doc["_id"] = insert_result.inserted_id
-
-    # Phase 2: grant. Key derived from _id so retries never double-credit.
-    return await _execute_grant(payment_doc)
 
 
 @app.post("/adapter/billing/payments/{payment_id}/retry")
 async def billing_retry_payment(
     payment_id: str, _auth: bool = Depends(require_operator)
 ):
-    """Retry a failed grant, reusing the SAME idempotency key (grant:{_id}).
-
-    AgentX either applies the grant once or reports duplicate — there is no
-    sequence of retries that credits twice.
+    """Payments are not stored locally (AgentX's ledger is the source of truth),
+    so there is no saved failed payment to retry. A failed grant surfaces as an
+    error at submit time; resubmitting with the same client_request_id is safe
+    because the grant idempotency key is grant:{client_request_id}.
     """
-    if payments_collection is None:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable")
-
-    try:
-        oid = ObjectId(payment_id)
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid payment_id")
-
-    payment_doc = await payments_collection.find_one({"_id": oid})
-    if not payment_doc:
-        raise HTTPException(status_code=404, detail="Payment not found")
-
-    if payment_doc.get("status") == "confirmed":
-        # Already done — return as-is rather than re-granting.
-        return _serialize_payment(payment_doc)
-
-    return await _execute_grant(payment_doc)
+    raise HTTPException(
+        status_code=404,
+        detail="Payment retry is not available: payments are not stored. Resubmit the payment instead.",
+    )
 
 
 # ---------------------------------------------------------------------------
